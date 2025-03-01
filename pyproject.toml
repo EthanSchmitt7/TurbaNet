@@ -1,0 +1,26 @@
+[tool.ruff]
+line-length = 99
+
+[tool.ruff.lint]
+select = ["ANN", "E", "F", "W"]
+
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turbanet"
+version = "0.1.0"
+authors = [{ name = "Ethan Schmitt", email = "ethanschmitt@gmail.com" }]
+description = "A package designed for fast training and inference for large numbers of small neural networks simultaneously."
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/EthanSchmitt7/TurbaNet"
+Issues = "https://github.com/EthanSchmitt7/TurbaNet/issues"
