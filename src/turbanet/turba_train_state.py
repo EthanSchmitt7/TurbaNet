@@ -109,7 +109,7 @@ class TurbaTrainState(TrainState):
         return predict(self, {"input": input_data})
 
     def train(
-        self, input_data: np.ndarray, output_data: np.ndarray, loss_fn
+        self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable
     ) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
         if len(self) == 1 and input_data.shape[0] != 1:
             input_data = input_data.reshape(1, *input_data.shape)
