@@ -266,26 +266,33 @@ class TurbaTrainState(TrainState):
         params = {}
         for key in self.params.keys():
             params[key] = {}
-            params[key]["bias"] = jnp.mean(self.params[key]["bias"], axis=0)
-            params[key]["kernel"] = jnp.mean(self.params[key]["kernel"], axis=0)
+            params[key]["bias"] = jnp.mean(self.params[key]["bias"], axis=0).reshape(1, -1)
+            params[key]["kernel"] = jnp.expand_dims(
+                jnp.mean(self.params[key]["kernel"], axis=0), 0
+            )
 
             mu[key] = {}
-            mu[key]["bias"] = jnp.mean(self.opt_state[0].mu[key]["bias"], axis=0)
-            mu[key]["kernel"] = jnp.mean(self.opt_state[0].mu[key]["kernel"], axis=0)
+            mu[key]["bias"] = jnp.mean(self.opt_state[0].mu[key]["bias"], axis=0).reshape(1, -1)
+            mu[key]["kernel"] = jnp.expand_dims(
+                jnp.mean(self.opt_state[0].mu[key]["kernel"], axis=0), 0
+            )
 
             nu[key] = {}
-            nu[key]["bias"] = jnp.mean(self.opt_state[0].nu[key]["bias"], axis=0)
-            nu[key]["kernel"] = jnp.mean(self.opt_state[0].nu[key]["kernel"], axis=0)
+            nu[key]["bias"] = jnp.mean(self.opt_state[0].nu[key]["bias"], axis=0).reshape(1, -1)
+            nu[key]["kernel"] = jnp.expand_dims(
+                jnp.mean(self.opt_state[0].nu[key]["kernel"], axis=0), 0
+            )
+
+        step = jnp.array([self.step.max()])
+        count = jnp.array([self.opt_state[0].count.max()], dtype="int32")
 
         return TurbaTrainState(
-            step=jnp.array([self.step.max()]),
+            step=step,
             apply_fn=self.apply_fn,
             params=params,
             tx=self.tx,
             opt_state=(
-                optax.ScaleByAdamState(
-                    count=jnp.array([self.opt_state[0].count.max()], dtype="int32"), mu=mu, nu=nu
-                ),
+                optax.ScaleByAdamState(count=count, mu=mu, nu=nu),
                 optax.EmptyState(),
             ),
         )
