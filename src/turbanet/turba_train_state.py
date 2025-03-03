@@ -60,6 +60,19 @@ def predict_fn(state: TurbaTrainState, batch: dict) -> ArrayImpl:
 predict = jax.vmap(predict_fn, in_axes=(0, 0))
 
 
+@partial(jax.jit, static_argnames=("loss_fn",))
+def check_loss_fn(
+    state: TurbaTrainState,
+    batch: dict,
+    loss_fn: Callable[[dict, dict, Callable], tuple[ArrayImpl, ArrayImpl]],
+) -> ArrayImpl:
+    """Evaluate a loss function."""
+    return loss_fn(state.params, batch, state.apply_fn)
+
+
+check_loss = jax.vmap(check_loss_fn, in_axes=(0, 0, None))
+
+
 class TurbaTrainState(TrainState):
     """TrainState for TurbaNet."""
 
@@ -107,6 +120,35 @@ class TurbaTrainState(TrainState):
             input_data = jnp.asarray(input_data)
 
         return predict(self, {"input": input_data})
+
+    def check_loss(
+        self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable
+    ) -> tuple[ArrayImpl, ArrayImpl]:
+        if len(self) == 1 and input_data.shape[0] != 1:
+            input_data = input_data.reshape(1, *input_data.shape)
+
+        if input_data.shape[0] != len(self):
+            raise ValueError(
+                f"Batch input shape {input_data.shape} does not match "
+                f"TrainState length {len(self)}."
+            )
+
+        if isinstance(input_data, jnp.ndarray):
+            input_data = jnp.asarray(input_data)
+
+        if len(self) == 1 and output_data.shape[0] != 1:
+            output_data = output_data.reshape(1, *output_data.shape)
+
+        if output_data.shape[0] != len(self):
+            raise ValueError(
+                f"Batch output shape {output_data.shape} does not match "
+                f"TrainState length {len(self)}."
+            )
+
+        if isinstance(output_data, jnp.ndarray):
+            output_data = jnp.asarray(output_data)
+
+        return check_loss(self, {"input": input_data, "output": output_data}, loss_fn)
 
     def train(
         self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable
