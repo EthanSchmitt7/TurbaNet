@@ -14,15 +14,7 @@ if TYPE_CHECKING:
     from jaxlib.xla_extension import ArrayImpl
 
 
-__all__ = ["TurbaTrainState"]
-
-
-@jax.jit
-def predict_fn(state: TurbaTrainState, batch: dict) -> ArrayImpl:
-    return state.apply_fn({"params": state.params}, batch["input"])
-
-
-vmap_predict = jax.vmap(predict_fn, in_axes=(0, 0))
+__all__ = ["TurbaTrainState", "create", "train", "predict"]
 
 
 def create_fn(
@@ -36,7 +28,33 @@ def create_fn(
     return TurbaTrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
 
-vmap_create = jax.vmap(create_fn, in_axes=(None, None, 0, 0))
+create = jax.vmap(create_fn, in_axes=(None, None, 0, None))
+
+
+@jax.jit
+def train_fn(state: TurbaTrainState, batch: dict) -> TurbaTrainState:
+    """Train for a single step."""
+
+    def loss_fn(params: dict) -> ArrayImpl:
+        logits = state.apply_fn({"params": params}, batch["input"])
+        loss = optax.softmax_cross_entropy(logits=logits, labels=batch["output"]).mean()
+        return loss, logits
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (loss, logits), grads = grad_fn(state.params)
+    state = state.apply_gradients(grads=grads)
+    return state, logits, loss
+
+
+train = jax.vmap(train_fn, in_axes=(0, 0))
+
+
+@jax.jit
+def predict_fn(state: TurbaTrainState, batch: dict) -> ArrayImpl:
+    return state.apply_fn({"params": state.params}, batch["input"])
+
+
+predict = jax.vmap(predict_fn, in_axes=(0, 0))
 
 
 class TurbaTrainState(TrainState):
@@ -59,13 +77,10 @@ class TurbaTrainState(TrainState):
         if learning_rate is None:
             learning_rate = 0.01
 
-        if isinstance(learning_rate, float):
-            learning_rate = jnp.ones(swarm_size) * learning_rate
-
-        if len(seed) != swarm_size or len(learning_rate) != swarm_size:
+        if len(seed) != swarm_size:
             raise ValueError("Seed and learning rate must be the same length as swarm_size.")
 
-        return vmap_create(model, input_size, seed, learning_rate)
+        return create(model, input_size, seed, learning_rate)
 
     def predict(self, input_data: np.ndarray) -> ArrayImpl:
         """Predicts on a batch of data.
@@ -85,10 +100,39 @@ class TurbaTrainState(TrainState):
                 f"TrainState length {len(self)}."
             )
 
-        if isinstance(input_data, np.ndarray):
+        if isinstance(input_data, jnp.ndarray):
             input_data = jnp.asarray(input_data)
 
-        return vmap_predict(self, {"input": input_data})
+        return predict(self, {"input": input_data})
+
+    def train(
+        self, input_data: np.ndarray, output_data: np.ndarray
+    ) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
+        if len(self) == 1 and input_data.shape[0] != 1:
+            input_data = input_data.reshape(1, *input_data.shape)
+
+        if input_data.shape[0] != len(self):
+            raise ValueError(
+                f"Batch input shape {input_data.shape} does not match "
+                f"TrainState length {len(self)}."
+            )
+
+        if isinstance(input_data, jnp.ndarray):
+            input_data = jnp.asarray(input_data)
+
+        if len(self) == 1 and output_data.shape[0] != 1:
+            output_data = output_data.reshape(1, *output_data.shape)
+
+        if output_data.shape[0] != len(self):
+            raise ValueError(
+                f"Batch output shape {output_data.shape} does not match "
+                f"TrainState length {len(self)}."
+            )
+
+        if isinstance(output_data, jnp.ndarray):
+            output_data = jnp.asarray(output_data)
+
+        return train(self, {"input": input_data, "output": output_data})
 
     @property
     def shape(self) -> tuple[int, ...]:
