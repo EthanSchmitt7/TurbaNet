@@ -44,9 +44,9 @@ def train_fn(
         return loss_fn(params, batch, state.apply_fn)
 
     grad_fn = jax.value_and_grad(wrapped_loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(state.params, batch)
+    (loss, prediction), grads = grad_fn(state.params, batch)
     state = state.apply_gradients(grads=grads)
-    return state, logits, loss
+    return state, prediction, loss
 
 
 train = jax.vmap(train_fn, in_axes=(0, 0, None))
