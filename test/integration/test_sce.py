@@ -4,6 +4,20 @@ from flax import linen as nn
 from turbanet import TurbaTrainState, softmax_cross_entropy
 
 
+def binary_generator(bit_count: int) -> np.ndarray:
+    binary_strings = []
+
+    def genbin(n: int, bs: str = "") -> None:
+        if len(bs) == n:
+            binary_strings.append(bs)
+        else:
+            genbin(n, bs + "0")
+            genbin(n, bs + "1")
+
+    genbin(bit_count)
+    return np.array([[int(c) for c in s] for s in binary_strings])
+
+
 class Brain(nn.Module):
     hidden_layers: int = 1
     hidden_size: int = 8
@@ -21,41 +35,27 @@ class Brain(nn.Module):
 
 # Network Parameters
 swarm_size = 100
-input_size = 3
+input_size = 6
 output_size = 2
 
 # Training Parameters
-learning_rate = 1e-2
-dataset_size = 8
-bootstrap_size = 8
-epochs = 1000
+learning_rate = 1e-5
+epochs = 100000
 
 # Generate a single batch input/output
-input = np.array(
-    [[0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1], [1, 0, 0], [1, 0, 1], [1, 1, 0], [1, 1, 1]]
-)
-output = np.array([[0], [1], [1], [1], [0], [1], [1], [0]])
-output = np.eye(output_size)[output]
+input = binary_generator(input_size)
+output = np.eye(output_size)[np.random.randint(0, output_size, input.shape[0])]
 
-# # Setup batch
+# Setup batch
 data = {
-    "input": np.array(
-        [
-            input[np.random.choice(dataset_size, bootstrap_size, replace=False)]
-            for _ in range(swarm_size)
-        ]
-    ),
-    "output": np.array(
-        [
-            output[np.random.choice(dataset_size, bootstrap_size, replace=False)]
-            for _ in range(swarm_size)
-        ]
-    ),
+    "input": np.repeat(np.expand_dims(input, 0), swarm_size, axis=0),
+    "output": np.repeat(np.expand_dims(output, 0), swarm_size, axis=0),
 }
+
 
 # Create networks
 my_states1 = TurbaTrainState.swarm(
-    Brain(hidden_layers=1, hidden_size=8, output_size=output_size),
+    Brain(hidden_layers=2, hidden_size=8, output_size=output_size),
     swarm_size=swarm_size,
     input_size=input_size,
     learning_rate=learning_rate,
