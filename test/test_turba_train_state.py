@@ -26,21 +26,21 @@ class TestTurbaTrainState(TestCase):
         self.assertEqual(len(self.swarm2), 10)
 
     def test_shape(self) -> None:
-        self.assertTupleEqual(self.swarm1.shape, (10, 3, 8))
-        self.assertTupleEqual(self.swarm2.shape, (10, 3, 8))
+        self.assertTupleEqual(self.swarm1.shape, (10, 3, 1))
+        self.assertTupleEqual(self.swarm2.shape, (10, 3, 1))
 
     def test_add(self) -> None:
         added_swarms = self.swarm1 + self.swarm2
         self.assertEqual(len(added_swarms), 10)
-        self.assertTupleEqual(added_swarms.shape, (10, 3, 8))
+        self.assertTupleEqual(added_swarms.shape, (10, 3, 1))
         for key in added_swarms.params.keys():
             # Add params together
             bias = self.swarm1.params[key]["bias"] + self.swarm2.params[key]["bias"]
             kernel = self.swarm1.params[key]["kernel"] + self.swarm2.params[key]["kernel"]
 
             # Test shape is correct
-            self.assertTupleEqual(bias.shape, (10, 8))
-            self.assertTupleEqual(kernel.shape, (10, 8))
+            self.assertTupleEqual(added_swarms.params[key]["bias"].shape, bias.shape)
+            self.assertTupleEqual(added_swarms.params[key]["kernel"].shape, kernel.shape)
 
             # Assert the params are correct
             np.testing.assert_array_equal(added_swarms.params[key]["bias"], bias)
@@ -55,7 +55,7 @@ class TestTurbaTrainState(TestCase):
     def test_append(self) -> None:
         appended_swarm = self.swarm1.append(self.swarm2)
         self.assertEqual(len(appended_swarm), 20)
-        self.assertTupleEqual(appended_swarm.shape, (20, 3, 8))
+        self.assertTupleEqual(appended_swarm.shape, (20, 3, 1))
         for key in appended_swarm.params.keys():
             # Add params together
             bias1 = self.swarm1.params[key]["bias"]
@@ -72,11 +72,11 @@ class TestTurbaTrainState(TestCase):
     def test_merge(self) -> None:
         merged_swarm = self.swarm1.merge()
         self.assertEqual(len(merged_swarm), 1)
-        self.assertTupleEqual(merged_swarm.shape, (3, 8))
+        self.assertTupleEqual(merged_swarm.shape, (1, 3, 1))
         for key in merged_swarm.params.keys():
             # Add params together
-            bias = np.mean(self.swarm1.params[key]["bias"], axis=0)
-            kernel = np.mean(self.swarm1.params[key]["kernel"], axis=0)
+            bias = np.expand_dims(np.mean(self.swarm1.params[key]["bias"], axis=0), 0)
+            kernel = np.expand_dims(np.mean(self.swarm1.params[key]["kernel"], axis=0), 0)
 
             # Assert the params are correct
             np.testing.assert_array_equal(merged_swarm.params[key]["bias"], bias)
