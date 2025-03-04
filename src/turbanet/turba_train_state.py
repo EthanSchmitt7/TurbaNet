@@ -181,7 +181,10 @@ class TurbaTrainState(TrainState):
 
     @property
     def shape(self) -> tuple[int, ...]:
-        return self.params[list(self.params.keys())[0]]["kernel"].shape
+        param_keys = list(self.params.keys())
+        first_kernel = self.params[param_keys[0]]["kernel"].shape
+        last_kernel = self.params[param_keys[-1]]["kernel"].shape
+        return tuple(list(first_kernel[0:2]) + [last_kernel[-1]])
 
     def __len__(self) -> int:
         return len(self.opt_state[0].count)
