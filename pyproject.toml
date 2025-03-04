@@ -4,10 +4,6 @@ line-length = 99
 [tool.ruff.lint]
 select = ["ANN", "E", "F", "W"]
 
-[build-system]
-requires = ["setuptools >= 61.0"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "turbanet"
 version = "0.1.0"
@@ -24,3 +20,7 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/EthanSchmitt7/TurbaNet"
 Issues = "https://github.com/EthanSchmitt7/TurbaNet/issues"
+
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
