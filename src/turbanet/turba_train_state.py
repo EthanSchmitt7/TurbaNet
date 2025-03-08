@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 import jax
 import jax.numpy as jnp
@@ -24,7 +24,7 @@ def create_fn(
     """Creates an initial `TurbaTrainState`."""
 
     # initialize parameters by passing an input template
-    params = model.init(jr.PRNGKey(seed), jnp.ones([1, input_size]))["params"]
+    params = model.init(jr.PRNGKey(seed), jnp.ones([1, *input_size]))["params"]
     tx = optax.adam(learning_rate=learning_rate)
     return TurbaTrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
@@ -46,7 +46,7 @@ def train_fn(
     grad_fn = jax.value_and_grad(wrapped_loss_fn, has_aux=True)
     (loss, prediction), grads = grad_fn(state.params, batch)
     state = state.apply_gradients(grads=grads)
-    return state, prediction, loss
+    return state, loss, prediction
 
 
 train = jax.vmap(train_fn, in_axes=(0, 0, None))
@@ -61,7 +61,7 @@ predict = jax.vmap(predict_fn, in_axes=(0, 0))
 
 
 @partial(jax.jit, static_argnames=("loss_fn",))
-def check_loss_fn(
+def evaluate_fn(
     state: TurbaTrainState,
     batch: dict,
     loss_fn: Callable[[dict, dict, Callable], tuple[ArrayImpl, ArrayImpl]],
@@ -70,7 +70,7 @@ def check_loss_fn(
     return loss_fn(state.params, batch, state.apply_fn)
 
 
-check_loss = jax.vmap(check_loss_fn, in_axes=(0, 0, None))
+evaluate = jax.vmap(evaluate_fn, in_axes=(0, 0, None))
 
 
 class TurbaTrainState(TrainState):
@@ -80,7 +80,7 @@ class TurbaTrainState(TrainState):
     def swarm(
         model: nn.Module,
         swarm_size: int,
-        input_size: int,
+        input_size: int | Iterable[int],
         seed: ArrayImpl = None,
         learning_rate: float = None,
     ) -> TurbaTrainState:
@@ -95,6 +95,9 @@ class TurbaTrainState(TrainState):
 
         if len(seed) != swarm_size:
             raise ValueError("Seed and learning rate must be the same length as swarm_size.")
+
+        if isinstance(input_size, int):
+            input_size = [input_size]
 
         return create(model, input_size, seed, learning_rate)
 
@@ -121,7 +124,7 @@ class TurbaTrainState(TrainState):
 
         return predict(self, {"input": input_data})
 
-    def check_loss(
+    def evaluate(
         self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable
     ) -> tuple[ArrayImpl, ArrayImpl]:
         if len(self) == 1 and input_data.shape[0] != 1:
@@ -148,7 +151,7 @@ class TurbaTrainState(TrainState):
         if isinstance(output_data, jnp.ndarray):
             output_data = jnp.asarray(output_data)
 
-        return check_loss(self, {"input": input_data, "output": output_data}, loss_fn)
+        return evaluate(self, {"input": input_data, "output": output_data}, loss_fn)
 
     def train(
         self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable
