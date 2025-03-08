@@ -6,7 +6,7 @@ select = ["ANN", "E", "F", "W"]
 
 [project]
 name = "turbanet"
-version = "0.1.0"
+version = "0.2.0.dev0"
 authors = [{ name = "Ethan Schmitt", email = "ethanschmitt@gmail.com" }]
 description = "A package designed for fast training and inference for large numbers of small neural networks simultaneously."
 readme = "README.md"
