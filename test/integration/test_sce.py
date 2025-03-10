@@ -29,7 +29,6 @@ class Brain(nn.Module):
             x = nn.Dense(self.hidden_size)(x)
             x = nn.relu(x)
         x = nn.Dense(self.output_size)(x)
-        x = nn.softmax(x)
         return x
 
 
