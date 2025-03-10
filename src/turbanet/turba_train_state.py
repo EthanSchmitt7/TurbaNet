@@ -35,26 +35,29 @@ create = jax.vmap(create_fn, in_axes=(None, None, 0, None))
 @partial(jax.jit, static_argnames=("loss_fn",))
 def train_fn(
     state: TurbaTrainState,
-    batch: dict,
+    input: ArrayImpl,
+    output: ArrayImpl,
     loss_fn: Callable[[dict, dict, Callable], tuple[ArrayImpl, ArrayImpl]],
-) -> TurbaTrainState:
+) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
     """Train for a single step."""
 
-    def wrapped_loss_fn(params: dict, batch: dict) -> tuple[ArrayImpl, ArrayImpl]:
-        return loss_fn(params, batch, state.apply_fn)
+    def wrapped_loss_fn(
+        params: dict, input: ArrayImpl, output: ArrayImpl
+    ) -> tuple[ArrayImpl, ArrayImpl]:
+        return loss_fn(params, input, output, state.apply_fn)
 
     grad_fn = jax.value_and_grad(wrapped_loss_fn, has_aux=True)
-    (loss, prediction), grads = grad_fn(state.params, batch)
+    (loss, prediction), grads = grad_fn(state.params, input, output)
     state = state.apply_gradients(grads=grads)
     return state, loss, prediction
 
 
-train = jax.vmap(train_fn, in_axes=(0, 0, None))
+train = jax.vmap(train_fn, in_axes=(0, 0, 0, None))
 
 
 @jax.jit
-def predict_fn(state: TurbaTrainState, batch: dict) -> ArrayImpl:
-    return state.apply_fn({"params": state.params}, batch["input"])
+def predict_fn(state: TurbaTrainState, input: ArrayImpl) -> ArrayImpl:
+    return state.apply_fn({"params": state.params}, input)
 
 
 predict = jax.vmap(predict_fn, in_axes=(0, 0))
@@ -63,14 +66,15 @@ predict = jax.vmap(predict_fn, in_axes=(0, 0))
 @partial(jax.jit, static_argnames=("loss_fn",))
 def evaluate_fn(
     state: TurbaTrainState,
-    batch: dict,
+    input: ArrayImpl,
+    output: ArrayImpl,
     loss_fn: Callable[[dict, dict, Callable], tuple[ArrayImpl, ArrayImpl]],
 ) -> ArrayImpl:
     """Evaluate a loss function."""
-    return loss_fn(state.params, batch, state.apply_fn)
+    return loss_fn(state.params, input, output, state.apply_fn)
 
 
-evaluate = jax.vmap(evaluate_fn, in_axes=(0, 0, None))
+evaluate = jax.vmap(evaluate_fn, in_axes=(0, 0, 0, None))
 
 
 class TurbaTrainState(TrainState):
@@ -122,7 +126,7 @@ class TurbaTrainState(TrainState):
         if isinstance(input_data, jnp.ndarray):
             input_data = jnp.asarray(input_data)
 
-        return predict(self, {"input": input_data})
+        return predict(self, input_data)
 
     def evaluate(
         self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable
@@ -151,7 +155,7 @@ class TurbaTrainState(TrainState):
         if isinstance(output_data, jnp.ndarray):
             output_data = jnp.asarray(output_data)
 
-        return evaluate(self, {"input": input_data, "output": output_data}, loss_fn)
+        return evaluate(self, input_data, output_data, loss_fn)
 
     def train(
         self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable
@@ -165,7 +169,7 @@ class TurbaTrainState(TrainState):
                 f"TrainState length {len(self)}."
             )
 
-        if isinstance(input_data, jnp.ndarray):
+        if not isinstance(input_data, jnp.ndarray):
             input_data = jnp.asarray(input_data)
 
         if len(self) == 1 and output_data.shape[0] != 1:
@@ -177,10 +181,10 @@ class TurbaTrainState(TrainState):
                 f"TrainState length {len(self)}."
             )
 
-        if isinstance(output_data, jnp.ndarray):
+        if not isinstance(output_data, jnp.ndarray):
             output_data = jnp.asarray(output_data)
 
-        return train(self, {"input": input_data, "output": output_data}, loss_fn)
+        return train(self, input_data, output_data, loss_fn)
 
     @property
     def shape(self) -> tuple[int, ...]:
