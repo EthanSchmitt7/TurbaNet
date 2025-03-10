@@ -19,9 +19,19 @@ __all__ = ["TurbaTrainState"]
 
 
 def create_fn(
-    model: nn.Module, input_size: int, seed: ArrayImpl, learning_rate: float
+    model: nn.Module, input_size: int, seed: int, learning_rate: float
 ) -> TurbaTrainState:
-    """Creates an initial `TurbaTrainState`."""
+    """Creates an initial `TurbaTrainState`.
+
+    Args:
+        model: The model to train.
+        input_size: The size of the input.
+        seed: The seed to use for initialization.
+        learning_rate: The learning rate to use.
+
+    Returns:
+        TurbaTrainState: A `TurbaTrainState` object.
+    """
 
     # initialize parameters by passing an input template
     params = model.init(jr.PRNGKey(seed), jnp.ones([1, *input_size]))["params"]
@@ -39,7 +49,18 @@ def train_fn(
     output: ArrayImpl,
     loss_fn: Callable[[dict, dict, Callable], tuple[ArrayImpl, ArrayImpl]],
 ) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
-    """Train for a single step."""
+    """Train for a single step.
+
+    Args:
+        state: The current `TurbaTrainState` object.
+        input: The input to the model.
+        output: The output of the model.
+        loss_fn: The loss function to use.
+
+    Returns:
+        tuple[TurbaTrainState, ArrayImpl, ArrayImpl]: The updated
+            (state, loss, prediction).
+    """
 
     def wrapped_loss_fn(
         params: dict, input: ArrayImpl, output: ArrayImpl
@@ -57,6 +78,15 @@ train = jax.vmap(train_fn, in_axes=(0, 0, 0, None))
 
 @jax.jit
 def predict_fn(state: TurbaTrainState, input: ArrayImpl) -> ArrayImpl:
+    """Predict on a batch of data.
+
+    Args:
+        state: The current `TurbaTrainState` object.
+        input: The input to the model.
+
+    Returns:
+        ArrayImpl: The prediction of the model.
+    """
     return state.apply_fn({"params": state.params}, input)
 
 
@@ -70,7 +100,16 @@ def evaluate_fn(
     output: ArrayImpl,
     loss_fn: Callable[[dict, dict, Callable], tuple[ArrayImpl, ArrayImpl]],
 ) -> ArrayImpl:
-    """Evaluate a loss function."""
+    """Evaluate a loss function.
+
+    Args:
+        state: The current `TurbaTrainState` object.
+        input: The input to the model.
+        output: The expected output of the model.
+        loss_fn: The loss function to use.
+
+    Returns:
+        ArrayImpl: The loss of the model."""
     return loss_fn(state.params, input, output, state.apply_fn)
 
 
@@ -88,6 +127,18 @@ class TurbaTrainState(TrainState):
         seed: ArrayImpl = None,
         learning_rate: float = None,
     ) -> TurbaTrainState:
+        """Creates a swarm of initial `TurbaTrainState`s.
+
+        Args:
+            model: The model to train.
+            swarm_size: The size of the swarm.
+            input_size: The size of the input.
+            seed: The seed to use for initialization.
+            learning_rate: The learning rate to use.
+
+        Returns:
+            TurbaTrainState: A `TurbaTrainState` object.
+        """
         if seed is None:
             seed = 0
 
@@ -109,10 +160,11 @@ class TurbaTrainState(TrainState):
         """Predicts on a batch of data.
 
         Args:
-            input_data: A batch of data to predict on of shape (swarm_size, batch_size, input_size)
+            input_data: A batch of data to predict on of shape
+                (swarm_size, batch_size, input_size)
 
         Returns:
-            A batch of predictions
+            ArrayImpl: A batch of predictions
         """
         if len(self) == 1 and input_data.shape[0] != 1:
             input_data = input_data.reshape(1, *input_data.shape)
@@ -131,6 +183,18 @@ class TurbaTrainState(TrainState):
     def evaluate(
         self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable
     ) -> tuple[ArrayImpl, ArrayImpl]:
+        """Evaluates a loss function on a batch of data.
+
+        Args:
+            input_data: A batch of data to evaluate on of shape
+                (swarm_size, batch_size, input_size)
+            output_data: A batch of expected outputs of shape
+                (swarm_size, batch_size, output_size)
+            loss_fn: The loss function to use.
+
+        Returns:
+            tuple[ArrayImpl, ArrayImpl]: A batch of (loss, prediction)
+        """
         if len(self) == 1 and input_data.shape[0] != 1:
             input_data = input_data.reshape(1, *input_data.shape)
 
@@ -160,6 +224,18 @@ class TurbaTrainState(TrainState):
     def train(
         self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable
     ) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
+        """Trains on a batch of data.
+
+        Args:
+            input_data: A batch of data to train on of shape
+                (swarm_size, batch_size, input_size)
+            output_data: A batch of data to train on of shape
+                (swarm_size, batch_size, output_size)
+
+        Returns:
+            tuple[TurbaTrainState, ArrayImpl, ArrayImpl]: The updated
+                (TrainState, loss, prediction)
+        """
         if len(self) == 1 and input_data.shape[0] != 1:
             input_data = input_data.reshape(1, *input_data.shape)
 
