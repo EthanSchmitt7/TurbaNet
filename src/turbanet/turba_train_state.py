@@ -19,7 +19,7 @@ __all__ = ["TurbaTrainState"]
 
 
 def create_fn(
-    model: nn.Module, input_size: int, seed: int, learning_rate: float
+    model: nn.Module, sample_input: ArrayImpl, seed: int, learning_rate: float
 ) -> TurbaTrainState:
     """Creates an initial `TurbaTrainState`.
 
@@ -34,7 +34,7 @@ def create_fn(
     """
 
     # initialize parameters by passing an input template
-    params = model.init(jr.PRNGKey(seed), jnp.ones([1, *input_size]))["params"]
+    params = model.init(jr.PRNGKey(seed), sample_input)["params"]
     tx = optax.adam(learning_rate=learning_rate)
     return TurbaTrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
@@ -123,7 +123,7 @@ class TurbaTrainState(TrainState):
     def swarm(
         model: nn.Module,
         swarm_size: int,
-        input_size: int | Iterable[int],
+        sample_input: ArrayImpl,
         seed: ArrayImpl = None,
         learning_rate: float = None,
     ) -> TurbaTrainState:
@@ -151,10 +151,7 @@ class TurbaTrainState(TrainState):
         if len(seed) != swarm_size:
             raise ValueError("Seed and learning rate must be the same length as swarm_size.")
 
-        if isinstance(input_size, int):
-            input_size = [input_size]
-
-        return create(model, input_size, seed, learning_rate)
+        return create(model, sample_input, seed, learning_rate)
 
     def predict(self, input_data: np.ndarray) -> ArrayImpl:
         """Predicts on a batch of data.
