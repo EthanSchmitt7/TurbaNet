@@ -48,7 +48,7 @@ my_states1 = TurbaTrainState.swarm(
 )
 
 # Original loss
-initial_loss, initial_prediction = my_states1.check_loss(data["input"], data["output"], l2_loss)
+initial_loss, initial_prediction = my_states1.evaluate(data["input"], data["output"], l2_loss)
 print(
     f"Initial loss\n"
     f"Mean: {np.mean(initial_loss):7.5} | "
@@ -58,7 +58,7 @@ print(
 
 # Train for a while
 for i in range(epochs):
-    my_states1, prediction, loss = my_states1.train(data["input"], data["output"], l2_loss)
+    my_states1, loss, prediction = my_states1.train(data["input"], data["output"], l2_loss)
 
     if i % 100 == 0:
         print(
@@ -74,11 +74,11 @@ print(
 
 # Merge the swarm and check the loss
 my_states2: TurbaTrainState = my_states1.merge()
-my_states2, prediction, loss = my_states2.train(
+my_states2, loss, prediction = my_states2.train(
     np.expand_dims(input, 0), np.expand_dims(output, 0), l2_loss
 )
 print(f"\nMean of Weights: {loss[0]:7.5}")
 
 # Take the mean of their answers instead
-loss, prediction = my_states1.check_loss(data["input"], data["output"], l2_loss)
+loss, prediction = my_states1.evaluate(data["input"], data["output"], l2_loss)
 print(f"Mean of Solutions: {np.mean(loss):7.5}")

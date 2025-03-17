@@ -29,7 +29,6 @@ class Brain(nn.Module):
             x = nn.Dense(self.hidden_size)(x)
             x = nn.relu(x)
         x = nn.Dense(self.output_size)(x)
-        x = nn.softmax(x)
         return x
 
 
@@ -63,13 +62,13 @@ my_states1 = TurbaTrainState.swarm(
 
 # Original loss
 # Take the mean of their answers instead
-loss, prediction = my_states1.check_loss(data["input"], data["output"], softmax_cross_entropy)
+loss, prediction = my_states1.evaluate(data["input"], data["output"], softmax_cross_entropy)
 print(f"Initial loss | Mean: {np.mean(loss)} | Min: {np.min(loss)} | Max: {np.max(loss)}\n")
 
 
 # Train for a while
 for i in range(epochs):
-    my_states1, prediction, loss = my_states1.train(
+    my_states1, loss, prediction = my_states1.train(
         data["input"], data["output"], softmax_cross_entropy
     )
 
@@ -85,12 +84,12 @@ print(f"\nFinal loss | Mean: {np.mean(loss)} | Min: {np.min(loss)} | Max: {np.ma
 
 # Merge the swarm and check the loss
 my_states2: TurbaTrainState = my_states1.merge()
-my_states2, prediction, loss = my_states2.train(
+my_states2, loss, prediction = my_states2.train(
     np.expand_dims(input, 0), np.expand_dims(output, 0), softmax_cross_entropy
 )
 print(f"\nMean of Weights: {loss[0]}")
 
 
 # Take the mean of their answers instead
-loss, prediction = my_states1.check_loss(data["input"], data["output"], softmax_cross_entropy)
+loss, prediction = my_states1.evaluate(data["input"], data["output"], softmax_cross_entropy)
 print("Mean of Solutions: ", np.mean(loss))
