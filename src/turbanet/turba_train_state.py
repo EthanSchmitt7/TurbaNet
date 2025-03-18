@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Iterable
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +12,8 @@ from flax import linen as nn
 from flax.training.train_state import TrainState
 
 if TYPE_CHECKING:
+    from typing import Callable
+
     from jaxlib.xla_extension import ArrayImpl
 
 
@@ -19,15 +21,18 @@ __all__ = ["TurbaTrainState"]
 
 
 def create_fn(
-    model: nn.Module, sample_input: ArrayImpl, seed: int, learning_rate: float
+    model: nn.Module,
+    optimizer: optax.GradientTransformation,
+    sample_input: ArrayImpl,
+    seed: int,
 ) -> TurbaTrainState:
     """Creates an initial `TurbaTrainState`.
 
     Args:
         model: The model to train.
+        optimizer: The optimizer to use.
         input_size: The size of the input.
         seed: The seed to use for initialization.
-        learning_rate: The learning rate to use.
 
     Returns:
         TurbaTrainState: A `TurbaTrainState` object.
@@ -35,11 +40,10 @@ def create_fn(
 
     # initialize parameters by passing an input template
     params = model.init(jr.PRNGKey(seed), sample_input)["params"]
-    tx = optax.adam(learning_rate=learning_rate)
-    return TurbaTrainState.create(apply_fn=model.apply, params=params, tx=tx)
+    return TurbaTrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
 
 
-create = jax.vmap(create_fn, in_axes=(None, None, 0, None))
+create = jax.vmap(create_fn, in_axes=(None, None, None, 0))
 
 
 @partial(jax.jit, static_argnames=("loss_fn",))
@@ -122,19 +126,19 @@ class TurbaTrainState(TrainState):
     @staticmethod
     def swarm(
         model: nn.Module,
+        optimizer: optax.GradientTransformation,
         swarm_size: int,
         sample_input: ArrayImpl,
         seed: ArrayImpl = None,
-        learning_rate: float = None,
     ) -> TurbaTrainState:
         """Creates a swarm of initial `TurbaTrainState`s.
 
         Args:
             model: The model to train.
+            optimizer: The optimizer to use.
             swarm_size: The size of the swarm.
             input_size: The size of the input.
             seed: The seed to use for initialization.
-            learning_rate: The learning rate to use.
 
         Returns:
             TurbaTrainState: A `TurbaTrainState` object.
@@ -145,13 +149,10 @@ class TurbaTrainState(TrainState):
         if isinstance(seed, int):
             seed = jnp.linspace(seed, swarm_size - 1, swarm_size).astype(int)
 
-        if learning_rate is None:
-            learning_rate = 0.01
-
         if len(seed) != swarm_size:
             raise ValueError("Seed and learning rate must be the same length as swarm_size.")
 
-        return create(model, sample_input, seed, learning_rate)
+        return create(model, optimizer, sample_input, seed)
 
     def predict(self, input_data: np.ndarray) -> ArrayImpl:
         """Predicts on a batch of data.
