@@ -1,21 +1,21 @@
 # TurbaNet
----
+
 TurbaNet is a lightweight and user-friendly API wrapper for the JAX library, designed to simplify and accelerate the setup of swarm-based training, evaluation, and simulation of small neural networks.​ Based on the work presented by Will Whitney in his blog post from 2021.[^1]
 
 ## Key Features
----
+
 - Simplified API: Provides an intuitive interface for configuring and managing swarm-based neural network tasks.​
 - Efficiency: Leverages JAX's capabilities to offer accelerated computation for training and evaluation processes.​
 - Flexibility: Supports various configurations, allowing users to tailor the swarm behavior to specific needs.​
 
 ## Installation
----
+
 To install TurbaNet, ensure that you have Python and pip installed. Then, run:
 
 `pip install turbanet`
 
 ## Getting Started
----
+
 Here's a basic example demonstrating how to initialize and use TurbaNet:
 
 ```
@@ -35,7 +35,6 @@ print(f"Swarm Accuracy: {accuracy}%")
 For more detailed tutorials and examples, please refer to the documentation.
 
 ## Contributing
----
 
 We welcome contributions to TurbaNet! If you'd like to contribute, please follow these steps:
 
@@ -60,7 +59,6 @@ We welcome contributions to TurbaNet! If you'd like to contribute, please follow
 7. Submit a Pull Request: Navigate to the original repository and click on "New Pull Request" to submit your changes for review.​
 
 ## License
----
 This project is licensed under the MIT License. See the [LICENSE](https://github.com/EthanSchmitt7/TurbaNet/blob/main/LICENSE) file for more details.
 
 ## References
