@@ -19,17 +19,56 @@ To install TurbaNet, ensure that you have Python and pip installed. Then, run:
 Here's a basic example demonstrating how to initialize and use TurbaNet:
 
 ```
-import turbanet as tn
+import matplotlib.pyplot as plt
+import numpy as np
+import optax
+from flax import linen as nn
+from turbanet import TurbaTrainState, mse
+
+# Set numpy random seed for reproducable results
+np.random.seed(0)
+
+# Sample input
+X_data = np.random.randint(0, 2, (10, 10)).astype(float)
+y_data = np.random.randint(0, 2, (10, 1)).astype(float)
+
+
+# Define model for the swarm
+class MyModel(nn.Module):
+    hidden_dim: int = 32
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(self.hidden_dim)(x)
+        x = nn.relu(x)
+        x = nn.Dense(1)(x)
+        x = nn.sigmoid(x)
+        return x
+
+
+# Define optimizer
+optimizer = optax.adam(learning_rate=0.01)
+
+# Define the size of the swarm
+swarm_size = 10
 
 # Initialize the swarm with desired parameters
-swarm = tn.Swarm(num_networks=10, input_size=784, hidden_layers=[128, 64], output_size=10)
+swarm = TurbaTrainState.swarm(MyModel(), optimizer, swarm_size, X_data[0].reshape(1, -1))
 
 # Train the swarm on your dataset
-swarm.train(data_loader, epochs=10, learning_rate=0.01)
+epochs = 100
+losses = np.zeros((epochs, swarm_size))
+for epoch in range(epochs):
+    X = np.expand_dims(X_data, 0).repeat(len(swarm), axis=0)
+    y = np.expand_dims(y_data, 0).repeat(len(swarm), axis=0)
+    swarm, losses[epoch], predictions = swarm.train(X, y, mse)
 
-# Evaluate the swarm's performance
-accuracy = swarm.evaluate(test_loader)
-print(f"Swarm Accuracy: {accuracy}%")
+# Plot the loss curves from training
+plt.plot(losses)
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.show()
+
 ```
 
 For more detailed tutorials and examples, please refer to the documentation.
