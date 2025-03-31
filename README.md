@@ -14,6 +14,9 @@ To install TurbaNet, ensure that you have Python and pip installed. Then, run:
 
 `pip install turbanet`
 
+TurbaNet train states require models and optimizers from Flax and Optax which can be installed with:
+`pip install flax optax`
+
 ## Getting Started
 
 Here's a basic example demonstrating how to initialize and use TurbaNet:
