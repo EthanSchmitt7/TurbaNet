@@ -1,6 +1,7 @@
 from unittest import TestCase
 
 import numpy as np
+import optax
 from flax import linen as nn
 
 from turbanet import TurbaTrainState
@@ -18,8 +19,14 @@ class TestModule(nn.Module):
 
 class TestTurbaTrainState(TestCase):
     def setUp(self) -> None:
-        self.swarm1 = TurbaTrainState.swarm(TestModule(), swarm_size=10, input_size=3)
-        self.swarm2 = TurbaTrainState.swarm(TestModule(), swarm_size=10, input_size=3)
+        optimizer = optax.adam(learning_rate=0.1)
+        sample_input = np.random.rand(3)
+        self.swarm1 = TurbaTrainState.swarm(
+            TestModule(), swarm_size=10, optimizer=optimizer, sample_input=sample_input
+        )
+        self.swarm2 = TurbaTrainState.swarm(
+            TestModule(), swarm_size=10, optimizer=optimizer, sample_input=sample_input
+        )
 
     def test_len(self) -> None:
         self.assertEqual(len(self.swarm1), 10)
@@ -96,10 +103,17 @@ class TestTurbaTrainState(TestCase):
         self.swarm1.predict(input_data)
 
         # Single network, single batch
-        self.single_network = TurbaTrainState.swarm(TestModule(), swarm_size=1, input_size=3)
+        optimizer = optax.adam(learning_rate=0.1)
+        sample_input = np.random.rand(3)
+        self.swarm1 = TurbaTrainState.swarm(
+            TestModule(), swarm_size=10, optimizer=optimizer, sample_input=sample_input
+        )
+        single_network = TurbaTrainState.swarm(
+            TestModule(), swarm_size=1, optimizer=optimizer, sample_input=sample_input
+        )
         input_data = np.random.rand(5, 3)
-        self.single_network.predict(input_data)
+        single_network.predict(input_data)
 
         # Single network, multi-batch
         input_data = np.random.rand(8, 5, 3)
-        self.single_network.predict(input_data)
+        single_network.predict(input_data)
