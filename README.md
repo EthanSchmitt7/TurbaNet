@@ -18,11 +18,26 @@ TurbaNet train states require models and optimizers from Flax and Optax which ca
 
 `pip install flax optax`
 
+## GPU Support
+
+TurbaNet is built on top of [JAX](https://docs.jax.dev/en/latest/index.html) and fully supports GPU acceleration out of the box. To take advantage of GPU-based training, ensure your environment is configured correctly with the appropriate CUDA and cuDNN versions supported by JAX.
+
+Refer to the official [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for detailed instructions and compatibility tables, including supported CUDA versions and platform-specific recommendations.
+
+If JAX detects a supported GPU and the correct environment configuration, TurbaNet will automatically execute on the GPU without any additional setup.
+
+You can verify whether GPU support is enabled by running:
+
+```python
+from jax.extend.backend import get_backend
+print(get_backend().platform)  # Should return 'gpu' if GPU is active
+```
+
 ## Getting Started
 
 Here's a basic example demonstrating how to initialize and use TurbaNet:
 
-```
+```python
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
