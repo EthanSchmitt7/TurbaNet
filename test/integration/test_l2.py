@@ -1,4 +1,5 @@
 import numpy as np
+import optax
 from flax import linen as nn
 
 from turbanet import TurbaTrainState, l2_loss
@@ -40,11 +41,12 @@ data = {
 }
 
 # Create networks
+optimizer = optax.adam(learning_rate=learning_rate)
 my_states1 = TurbaTrainState.swarm(
     Brain(hidden_layers=1, hidden_size=8, output_size=output_size),
     swarm_size=swarm_size,
-    input_size=input_size,
-    learning_rate=learning_rate,
+    optimizer=optimizer,
+    sample_input=input[0].reshape(1, input_size),
 )
 
 # Original loss
@@ -68,17 +70,4 @@ for i in range(epochs):
             f"Max loss: {np.max(loss):7.5}"
         )
 
-print(
-    f"\nFinal loss\nMean: {np.mean(loss):7.5} | Min: {np.min(loss):7.5} | Max: {np.max(loss):7.5}"
-)
-
-# Merge the swarm and check the loss
-my_states2: TurbaTrainState = my_states1.merge()
-my_states2, loss, prediction = my_states2.train(
-    np.expand_dims(input, 0), np.expand_dims(output, 0), l2_loss
-)
-print(f"\nMean of Weights: {loss[0]:7.5}")
-
-# Take the mean of their answers instead
-loss, prediction = my_states1.evaluate(data["input"], data["output"], l2_loss)
-print(f"Mean of Solutions: {np.mean(loss):7.5}")
+assert np.mean(loss) < np.mean(initial_loss)

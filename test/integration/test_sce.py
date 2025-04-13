@@ -1,4 +1,5 @@
 import numpy as np
+import optax
 from flax import linen as nn
 
 from turbanet import TurbaTrainState, softmax_cross_entropy
@@ -38,8 +39,8 @@ input_size = 6
 output_size = 2
 
 # Training Parameters
-learning_rate = 1e-5
-epochs = 100000
+learning_rate = 1e-3
+epochs = 1000
 
 # Generate a single batch input/output
 input = binary_generator(input_size)
@@ -53,17 +54,22 @@ data = {
 
 
 # Create networks
+optimizer = optax.adam(learning_rate=learning_rate)
 my_states1 = TurbaTrainState.swarm(
     Brain(hidden_layers=2, hidden_size=8, output_size=output_size),
     swarm_size=swarm_size,
-    input_size=input_size,
-    learning_rate=learning_rate,
+    optimizer=optimizer,
+    sample_input=input[0].reshape(1, input_size),
 )
 
 # Original loss
 # Take the mean of their answers instead
-loss, prediction = my_states1.evaluate(data["input"], data["output"], softmax_cross_entropy)
-print(f"Initial loss | Mean: {np.mean(loss)} | Min: {np.min(loss)} | Max: {np.max(loss)}\n")
+initial_loss, initial_prediction = my_states1.evaluate(
+    data["input"], data["output"], softmax_cross_entropy
+)
+print(
+    f"Initial loss | Mean: {np.mean(initial_loss)} | Min: {np.min(initial_loss)} | Max: {np.max(initial_loss)}\n"
+)
 
 
 # Train for a while
@@ -80,16 +86,4 @@ for i in range(epochs):
             f"Max loss: {np.max(loss)}"
         )
 
-print(f"\nFinal loss | Mean: {np.mean(loss)} | Min: {np.min(loss)} | Max: {np.max(loss)}")
-
-# Merge the swarm and check the loss
-my_states2: TurbaTrainState = my_states1.merge()
-my_states2, loss, prediction = my_states2.train(
-    np.expand_dims(input, 0), np.expand_dims(output, 0), softmax_cross_entropy
-)
-print(f"\nMean of Weights: {loss[0]}")
-
-
-# Take the mean of their answers instead
-loss, prediction = my_states1.evaluate(data["input"], data["output"], softmax_cross_entropy)
-print("Mean of Solutions: ", np.mean(loss))
+assert np.mean(loss) < np.mean(initial_loss)
