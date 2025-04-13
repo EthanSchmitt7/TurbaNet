@@ -29,8 +29,8 @@ If JAX detects a supported GPU and the correct environment configuration, TurbaN
 You can verify whether GPU support is enabled by running:
 
 ```python
-from jax.lib import xla_bridge
-print(xla_bridge.get_backend().platform)  # Should return 'gpu' if GPU is active
+from jax.extend.backend import get_backend
+print(get_backend().platform)  # Should return 'gpu' if GPU is active
 ```
 
 ## Getting Started

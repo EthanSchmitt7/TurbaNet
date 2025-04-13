@@ -1,6 +1,6 @@
-from jax.lib import xla_bridge
+from jax.extend.backend import get_backend
 
-platform = xla_bridge.get_backend().platform
+platform = get_backend().platform
 if platform != "GPU":
     print(f"GPU support not available, using {platform}")
 else:
