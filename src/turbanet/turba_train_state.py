@@ -422,3 +422,9 @@ class TurbaTrainState(TrainState):
                 optax.EmptyState(),
             ),
         )
+
+    def get_state(self, index: int) -> TurbaTrainState:
+        return jax.tree_util.tree_map(lambda x: x[index], self)
+
+    def remove_state(self, index: int) -> TurbaTrainState:
+        return jax.tree_util.tree_map(lambda x: jnp.delete(x, index, axis=0), self)
