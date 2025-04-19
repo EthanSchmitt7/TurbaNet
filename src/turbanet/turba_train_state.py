@@ -52,6 +52,7 @@ def train_fn(
     input: ArrayImpl,
     output: ArrayImpl,
     loss_fn: Callable[[dict, dict, Callable], tuple[ArrayImpl, ArrayImpl]],
+    **kwargs,
 ) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
     """Train for a single step.
 
@@ -67,12 +68,12 @@ def train_fn(
     """
 
     def wrapped_loss_fn(
-        params: dict, input: ArrayImpl, output: ArrayImpl
+        params: dict, input: ArrayImpl, output: ArrayImpl, **kwargs
     ) -> tuple[ArrayImpl, ArrayImpl]:
-        return loss_fn(params, input, output, state.apply_fn)
+        return loss_fn(params, input, output, state.apply_fn, **kwargs)
 
     grad_fn = jax.value_and_grad(wrapped_loss_fn, has_aux=True)
-    (loss, prediction), grads = grad_fn(state.params, input, output)
+    (loss, prediction), grads = grad_fn(state.params, input, output, **kwargs)
     state = state.apply_gradients(grads=grads)
     return state, loss, prediction
 
@@ -220,7 +221,7 @@ class TurbaTrainState(TrainState):
         return evaluate(self, input_data, output_data, loss_fn)
 
     def train(
-        self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable
+        self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable, **kwargs
     ) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
         """Trains on a batch of data.
 
@@ -258,7 +259,7 @@ class TurbaTrainState(TrainState):
         if not isinstance(output_data, jnp.ndarray):
             output_data = jnp.asarray(output_data)
 
-        return train(self, input_data, output_data, loss_fn)
+        return train(self, input_data, output_data, loss_fn, **kwargs)
 
     @property
     def shape(self) -> tuple[int, ...]:
