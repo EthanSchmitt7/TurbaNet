@@ -261,6 +261,13 @@ class TurbaTrainState(TrainState):
 
         return train(self, input_data, output_data, loss_fn, **kwargs)
 
+    def cost_analysis(self, input: ArrayImpl) -> dict:
+        return (
+            jax.jit(self.apply_fn)
+            .lower({"params": self.get_state(0).params}, input)
+            .cost_analysis()
+        )
+
     @property
     def shape(self) -> tuple[int, ...]:
         param_keys = list(self.params.keys())
