@@ -93,6 +93,9 @@ class TestTurbaTrainState(TestCase):
         self.assertEqual(self.swarm1.step[0], merged_swarm.step)
         self.assertEqual(self.swarm1.opt_state[0].count[0], merged_swarm.opt_state[0].count)
 
+    def test_get_state(self) -> None:
+        first_state = self.swarm1.get_state(0)
+
     def test_predict(self) -> None:
         # Multiple networks, Single batch
         input_data = np.random.rand(10, 1, 5, 3)
