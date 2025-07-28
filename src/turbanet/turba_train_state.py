@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from functools import partial
 from typing import TYPE_CHECKING
 
 import jax
@@ -46,13 +45,12 @@ def create_fn(
 create = jax.vmap(create_fn, in_axes=(None, None, None, 0))
 
 
-@partial(jax.jit, static_argnames=("loss_fn",))
 def train_fn(
     state: TurbaTrainState,
     input: ArrayImpl,
     output: ArrayImpl,
     loss_fn: Callable[[dict, dict, Callable], tuple[ArrayImpl, ArrayImpl]],
-    **kwargs,
+    **kwargs: dict,
 ) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
     """Train for a single step.
 
@@ -78,10 +76,9 @@ def train_fn(
     return state, loss, prediction
 
 
-train = jax.vmap(train_fn, in_axes=(0, 0, 0, None))
+train = jax.jit(jax.vmap(train_fn, in_axes=(0, 0, 0, None)), static_argnames=("loss_fn",))
 
 
-@jax.jit
 def predict_fn(state: TurbaTrainState, input: ArrayImpl) -> ArrayImpl:
     """Predict on a batch of data.
 
@@ -95,15 +92,11 @@ def predict_fn(state: TurbaTrainState, input: ArrayImpl) -> ArrayImpl:
     return state.apply_fn({"params": state.params}, input)
 
 
-predict = jax.vmap(predict_fn, in_axes=(0, 0))
+predict = jax.jit(jax.vmap(predict_fn, in_axes=(0, 0)))
 
 
-@partial(jax.jit, static_argnames=("loss_fn",))
 def evaluate_fn(
-    state: TurbaTrainState,
-    input: ArrayImpl,
-    output: ArrayImpl,
-    loss_fn: Callable[[dict, dict, Callable], tuple[ArrayImpl, ArrayImpl]],
+    state: TurbaTrainState, input: ArrayImpl, output: ArrayImpl, loss_fn: Callable
 ) -> ArrayImpl:
     """Evaluate a loss function.
 
@@ -118,7 +111,7 @@ def evaluate_fn(
     return loss_fn(state.params, input, output, state.apply_fn)
 
 
-evaluate = jax.vmap(evaluate_fn, in_axes=(0, 0, 0, None))
+evaluate = jax.jit(jax.vmap(evaluate_fn, in_axes=(0, 0, 0, None)), static_argnames=("loss_fn",))
 
 
 class TurbaTrainState(TrainState):
@@ -221,7 +214,7 @@ class TurbaTrainState(TrainState):
         return evaluate(self, input_data, output_data, loss_fn)
 
     def train(
-        self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable, **kwargs
+        self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable, **kwargs: dict
     ) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
         """Trains on a batch of data.
 
