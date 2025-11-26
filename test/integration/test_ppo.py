@@ -26,15 +26,18 @@ NUM_ORGANISMS = 1
 # Training Parameters
 SUPERVISED = False
 EPISODES = int(2e6)
-LR = 1e-3
+LR = 1e-5
 EPOCHS = 100
 BATCH_SIZE = 512
+CLIP_RANGE = 0.2
+ENTROPY_COEFFICIENT = 0.005
 
 # Logging
 try:
     from torch.utils.tensorboard import SummaryWriter
 
-    writer = SummaryWriter(log_dir="runs/testing")
+    writer = SummaryWriter(log_dir="test/tensorboard")
+    print("Logging to test/tensorboard")
 
 except ImportError:
     writer = None
@@ -96,11 +99,11 @@ def subjective_cases() -> np.ndarray:
 
 def correct_decision(environments: np.ndarray) -> np.ndarray:
     answered = np.full(environments.shape[0], fill_value=False, dtype=bool)
-    answers = np.zeros((environments.shape[0], len(Decision)))
+    answers = np.full((environments.shape[0], len(Decision)), fill_value=-0.1)
 
     # If the current cell has food, tell the organism to eat
     eat = environments[:, 4] == Tile.food_organism.value
-    answers[eat, Decision.eat.value] = 200
+    answers[eat, Decision.eat.value] = 2.0
     answered[eat] = True
 
     # If nearby cells have food and no other organisms, move towards food
@@ -109,10 +112,10 @@ def correct_decision(environments: np.ndarray) -> np.ndarray:
     right = environments[:, 5] == Tile.food.value
     down = environments[:, 7] == Tile.food.value
 
-    answers[np.logical_and(up, ~answered), Decision.up.value] = 100
-    answers[np.logical_and(left, ~answered), Decision.left.value] = 100
-    answers[np.logical_and(right, ~answered), Decision.right.value] = 100
-    answers[np.logical_and(down, ~answered), Decision.down.value] = 100
+    answers[np.logical_and(up, ~answered), Decision.up.value] = 1.0
+    answers[np.logical_and(left, ~answered), Decision.left.value] = 1.0
+    answers[np.logical_and(right, ~answered), Decision.right.value] = 1.0
+    answers[np.logical_and(down, ~answered), Decision.down.value] = 1.0
 
     answered[up] = True
     answered[left] = True
@@ -125,20 +128,20 @@ def correct_decision(environments: np.ndarray) -> np.ndarray:
     right = environments[:, 5] == Tile.food_organism.value
     down = environments[:, 7] == Tile.food_organism.value
 
-    answers[np.logical_and(up, ~answered), Decision.up.value] = 100
-    answers[np.logical_and(left, ~answered), Decision.left.value] = 100
-    answers[np.logical_and(right, ~answered), Decision.right.value] = 100
-    answers[np.logical_and(down, ~answered), Decision.down.value] = 100
+    answers[np.logical_and(up, ~answered), Decision.up.value] = 1.0
+    answers[np.logical_and(left, ~answered), Decision.left.value] = 1.0
+    answers[np.logical_and(right, ~answered), Decision.right.value] = 1.0
+    answers[np.logical_and(down, ~answered), Decision.down.value] = 1.0
 
     answered[up] = True
     answered[left] = True
     answered[right] = True
 
     # Add move options if no food is nearby
-    answers[~answered, Decision.up.value] = 100
-    answers[~answered, Decision.left.value] = 100
-    answers[~answered, Decision.right.value] = 100
-    answers[~answered, Decision.down.value] = 100
+    answers[~answered, Decision.up.value] = 1.0
+    answers[~answered, Decision.left.value] = 1.0
+    answers[~answered, Decision.right.value] = 1.0
+    answers[~answered, Decision.down.value] = 1.0
 
     return answers
 
@@ -154,8 +157,8 @@ def actor_loss_fn(
 ) -> tuple[ArrayLike, ArrayLike]:
     # Get the output of the actor
     logits = actor_apply_fn({"params": params}, x)
-    probabilities = jnp.exp(logits) / (jnp.sum(jnp.exp(logits), axis=-1, keepdims=True) + 1e-8)
-    log_probabilities = jnp.log(probabilities)
+    log_probabilities = jax.nn.log_softmax(logits)
+    probabilities = jnp.exp(log_probabilities)
     action_log_probabilities = jnp.take_along_axis(log_probabilities, actions, axis=-1)
 
     # Ratio between old and new policy, should be one at the first iteration
@@ -166,9 +169,8 @@ def actor_loss_fn(
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     # clipped surrogate loss
-    clip_range = 0.2
     policy_loss_1 = advantages * ratio
-    policy_loss_2 = advantages * jnp.clip(ratio, 1 - clip_range, 1 + clip_range)
+    policy_loss_2 = advantages * jnp.clip(ratio, 1 - CLIP_RANGE, 1 + CLIP_RANGE)
     policy_loss = -jnp.mean(jnp.minimum(policy_loss_1, policy_loss_2))
 
     # Adding entropy to encourage exploration
@@ -176,8 +178,7 @@ def actor_loss_fn(
     entropy_loss = -entropy
 
     # Total loss
-    entropy_coefficient = 0.01
-    loss = policy_loss + entropy_coefficient * entropy_loss
+    loss = policy_loss + ENTROPY_COEFFICIENT * entropy_loss
 
     return loss, logits
 
@@ -209,17 +210,21 @@ class Actor(nn.Module):
     hidden_layers: int = 1
     hidden_size: int = 64
     output_size: int = 1
+    gain: float = 0.01
 
     @nn.compact
     def __call__(self, x):  # noqa: ANN001, ANN204
         for _ in range(self.hidden_layers):
-            x = nn.Dense(self.hidden_size)(x)
+            x = nn.Dense(
+                self.hidden_size, kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2))
+            )(x)
             x = nn.tanh(x)
-        x = nn.Dense(self.output_size)(x)
+        x = nn.Dense(self.output_size, kernel_init=jax.nn.initializers.orthogonal(self.gain))(x)
         return x  # noqa: RET504
 
 
-class Critic(Actor): ...
+class Critic(Actor):
+    gain = 1.0
 
 
 def create_agents() -> tuple[TurbaTrainState, TurbaTrainState, TurbaTrainState]:
@@ -251,13 +256,9 @@ def create_random_states(swarm_size: int, batch_size: int) -> np.ndarray:
 
 def get_reward(state: np.ndarray, action: np.ndarray) -> np.ndarray:
     correct = correct_decision(state.reshape(-1, 9)).reshape(NUM_ORGANISMS, BATCH_SIZE, 6)
-    correct = correct / 100.0
 
     action = jnp.expand_dims(action, 2)
-    reward = jnp.take_along_axis(correct, action).squeeze(axis=2)
-
-    # Set reward to -0.1 for incorrect decisions
-    reward = reward.at[jnp.where(reward == 0)].set(-0.1)
+    reward = jnp.take_along_axis(correct, action, axis=-1).squeeze(axis=2)
 
     return reward
 
@@ -270,8 +271,9 @@ def execute_episode(
 
     # Get the action probabilities
     logits = actor.predict(states)
-    probabilities = jnp.exp(logits) / (jnp.sum(jnp.exp(logits), axis=-1, keepdims=True) + 1e-8)
-    log_probabilities = jnp.log(probabilities)
+    log_probabilities = jax.nn.log_softmax(logits)
+    probabilities = jnp.exp(log_probabilities)
+    entropy = -(log_probabilities * probabilities).sum(axis=-1).mean()
 
     # Sample actions in acordance with action probabilities
     rng, _rng = jax.random.split(rng)
@@ -308,19 +310,11 @@ def execute_episode(
     if writer is not None:
         writer.add_scalar("Loss/Actor", np.array(actor_loss), episode)
         writer.add_scalar("Loss/Critic", np.array(critic_loss), episode)
-        writer.add_scalar(
-            "Loss/Entropy",
-            np.array((log_probabilities * probabilities).sum(axis=-1).mean()),
-            episode,
-        )
+        writer.add_scalar("Loss/Entropy", -np.array(entropy), episode)
         writer.add_scalar("Other/Reward", np.array(rewards).mean(), episode)
         writer.add_scalar("Other/Advantage", np.array(advantages).mean(), episode)
         writer.add_scalar("Other/Values", np.array(all_values).mean(), episode)
-        writer.add_scalar(
-            "Other/Entropy",
-            -np.array((log_probabilities * probabilities).sum(axis=-1).mean()),
-            episode,
-        )
+        writer.add_scalar("Other/Entropy", np.array(entropy), episode)
         writer.add_histogram("Actor/Logits", np.array(logits).squeeze(), episode)
         writer.add_histogram("Actor/Probabilities", np.array(probabilities).squeeze(), episode)
         writer.add_histogram(
