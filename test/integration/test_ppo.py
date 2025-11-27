@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import jax
