@@ -36,15 +36,37 @@ ENTROPY_COEFFICIENT = 0.005
 try:
     from torch.utils.tensorboard import SummaryWriter
 
-    writer = SummaryWriter(log_dir="test/tensorboard2")
+    writer = SummaryWriter(log_dir="test/tensorboard")
     print("Logging to test/tensorboard")
 
 except ImportError:
     writer = None
     print("Torch not installed, tensorboard logging disabled")
-
 # Configure RNGs
 np.random.seed(0)
+
+
+class Decision(Enum):
+    idle = 0
+    left = 1
+    right = 2
+    up = 3
+    down = 4
+    eat = 5
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class Tile(Enum):
+    invalid = -1
+    empty = 0
+    food = 1
+    organism = 2
+    food_organism = 3
+
+    def __str__(self) -> str:
+        return self.name
 
 
 def definitive_cases() -> np.ndarray:
@@ -159,7 +181,7 @@ def actor_loss_fn(
     log_probabilities = jax.nn.log_softmax(logits)
     probabilities = jnp.exp(log_probabilities)
     action_log_probabilities = jnp.take_along_axis(
-        log_probabilities, actions[:, None], axis=-1
+        log_probabilities, actions[..., None], axis=-1
     ).squeeze()
 
     # Ratio between old and new policy, should be one at the first iteration
@@ -178,29 +200,6 @@ def actor_loss_fn(
     loss = policy_loss + ENTROPY_COEFFICIENT * entropy_loss
 
     return loss, logits
-
-
-class Decision(Enum):
-    idle = 0
-    left = 1
-    right = 2
-    up = 3
-    down = 4
-    eat = 5
-
-    def __str__(self) -> str:
-        return self.name
-
-
-class Tile(Enum):
-    invalid = -1
-    empty = 0
-    food = 1
-    organism = 2
-    food_organism = 3
-
-    def __str__(self) -> str:
-        return self.name
 
 
 class Actor(nn.Module):
@@ -247,127 +246,124 @@ def create_agents() -> tuple[TurbaTrainState, TurbaTrainState, TurbaTrainState]:
 
 def create_random_states(swarm_size: int, batch_size: int) -> np.ndarray:
     states = np.random.randint(0, 4, (swarm_size, batch_size, 9))
-    states[:, :, 4] = np.random.choice((2, 3), (swarm_size, batch_size), p=(0.8, 0.2))
+    states[..., 4] = np.random.choice((2, 3), (swarm_size, batch_size), p=(0.8, 0.2))
 
     return states
 
 
-def get_reward(state: np.ndarray, action: np.ndarray) -> np.ndarray:
-    correct = correct_decision(state.reshape(-1, 9)).reshape(NUM_ORGANISMS, BATCH_SIZE, 6)
-
-    action = jnp.expand_dims(action, 2)
-    reward = jnp.take_along_axis(correct, action, axis=-1).squeeze(axis=2)
+def get_reward(state: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
+    correct = correct_decision(state)
+    reward = jnp.take_along_axis(correct, action, axis=-1)
 
     return reward
 
 
-def execute_episode(
-    episode: int, rng, actor: TurbaTrainState, critic: TurbaTrainState
-) -> tuple[Any, TurbaTrainState, TurbaTrainState, float]:
-    # Create random environment states and get the correct decisions
-    states = create_random_states(NUM_ORGANISMS, BATCH_SIZE)
+def train(
+    actor: TurbaTrainState, critic: TurbaTrainState
+) -> tuple[TurbaTrainState, TurbaTrainState]:
+    rng = jax.random.PRNGKey(0)
+    for episode in range(EPISODES):
+        LOGGER.info(f"---- Episode {episode} ----")
+        # Create random environment states and get the correct decisions
+        start = perf_counter()
+        states = create_random_states(NUM_ORGANISMS, BATCH_SIZE)
+        state_time = perf_counter() - start
 
-    # Get the action probabilities
-    logits = actor.predict(states)
-    log_probabilities = jax.nn.log_softmax(logits)
-    probabilities = jnp.exp(log_probabilities)
-    entropy = -(log_probabilities * probabilities).sum(axis=-1).mean(axis=-1)
+        # Get the action probabilities
+        start = perf_counter()
+        logits = actor.predict(states)
+        log_probabilities = jax.nn.log_softmax(logits)
+        probabilities = jnp.exp(log_probabilities)
+        entropy = -(log_probabilities * probabilities).sum(axis=-1).mean(axis=-1)
 
-    # Sample actions in acordance with action probabilities
-    rng, _rng = jax.random.split(rng)
-    actions = jax.random.categorical(_rng, logits, shape=(NUM_ORGANISMS, BATCH_SIZE))
+        # Sample actions in acordance with action probabilities
+        rng, _rng = jax.random.split(rng)
+        actions = jax.random.categorical(_rng, logits, shape=(NUM_ORGANISMS, BATCH_SIZE))[
+            ..., None
+        ]
+        action_time = perf_counter() - start
 
-    # Get the reward
-    rewards = get_reward(states, actions)
-    predicted_reward = critic.predict(states)
+        # Get the reward
+        start = perf_counter()
+        rewards = get_reward(states, actions)
+        predicted_reward = critic.predict(states)
 
-    # Calculate advantage for each organism
-    advantages = (rewards - predicted_reward.squeeze()).reshape(NUM_ORGANISMS, BATCH_SIZE, 1)
-    actions = actions.reshape(NUM_ORGANISMS, BATCH_SIZE, 1)
-    rewards = rewards.reshape(NUM_ORGANISMS, BATCH_SIZE, 1)
+        # Calculate advantage for each organism
+        advantages = rewards - predicted_reward
 
-    # Standardize advantage
-    advantage_mean = advantages.mean(axis=1, keepdims=True)
-    advantage_std = advantages.std(axis=1, keepdims=True)
-    std_advantages = (advantages - advantage_mean) / (advantage_std + 1e-8)
+        # Standardize advantage
+        advantage_mean = advantages.mean(axis=1, keepdims=True)
+        advantage_std = advantages.std(axis=1, keepdims=True)
+        std_advantages = (advantages - advantage_mean) / (advantage_std + 1e-8)
+        reward_time = perf_counter() - start
 
-    # Prepare data for loss function
-    action_log_probabilities = jnp.take_along_axis(log_probabilities, actions, axis=-1)
-    y = jnp.concatenate((actions, std_advantages, action_log_probabilities), axis=2)
+        # Prepare data for loss function
+        start = perf_counter()
+        action_log_probabilities = jnp.take_along_axis(log_probabilities, actions, axis=-1)
+        y = jnp.concatenate((actions, std_advantages, action_log_probabilities), axis=2)
+        prep_time = perf_counter() - start
 
-    actor_losses = []
-    critic_losses = []
-    all_values = []
-    for _ in range(EPOCHS):
-        # Reinforcement
-        actor, actor_loss, _ = actor.train(states, y, actor_loss_fn)
-        critic, critic_loss, values = critic.train(states, rewards, mse)
+        start = perf_counter()
+        actor_losses = []
+        critic_losses = []
+        all_values = []
+        for _ in range(EPOCHS):
+            # Reinforcement
+            actor, actor_loss, _ = actor.train(states, y, actor_loss_fn)
+            critic, critic_loss, values = critic.train(states, rewards, mse)
 
-        actor_losses.append(actor_loss)
-        critic_losses.append(critic_loss)
-        all_values.append(values)
+            actor_losses.append(actor_loss)
+            critic_losses.append(critic_loss)
+            all_values.append(values)
 
-    if writer is not None:
-        if NUM_ORGANISMS == 1:
-            # Scalars
-            writer.add_scalar("Loss/Actor", np.array(actor_loss), episode)
-            writer.add_scalar("Loss/Critic", np.array(critic_loss), episode)
-            writer.add_scalar("Loss/Entropy", -np.array(entropy), episode)
-            writer.add_scalar("Other/Reward", np.array(rewards).mean(), episode)
-            writer.add_scalar("Other/Advantage", np.array(advantages).mean(), episode)
-            writer.add_scalar("Other/Values", np.array(all_values).mean(), episode)
-            writer.add_scalar("Other/Entropy", np.array(entropy), episode)
+        train_time = perf_counter() - start
 
-            # Histograms
-            writer.add_histogram("Actor/Logits", np.array(logits).squeeze(), episode)
-            writer.add_histogram("Actor/Probabilities", np.array(probabilities).squeeze(), episode)
-            writer.add_histogram(
-                "Actor/Log Probabilities", np.array(log_probabilities).squeeze(), episode
-            )
-            writer.add_histogram(
-                "Actor/Actions",
-                np.array(actions).astype(int).squeeze().round(),
-                episode,
-                bins=len(Decision),
-            )
-        else:
-            writer.add_histogram("Loss/Actor", np.array(actor_loss), episode)
-            writer.add_histogram("Loss/Critic", np.array(critic_loss), episode)
-            writer.add_histogram("Loss/Entropy", -np.array(entropy), episode)
-            writer.add_histogram("Other/Reward", np.array(rewards).mean(axis=1), episode)
-            writer.add_histogram("Other/Advantage", np.array(advantages).mean(axis=1), episode)
-            writer.add_histogram("Other/Values", np.array(all_values).mean(axis=1), episode)
-            writer.add_histogram("Other/Entropy", np.array(entropy), episode)
+        if writer is not None:
+            writer.add_scalar("Time/State", state_time, episode)
+            writer.add_scalar("Time/Action", action_time, episode)
+            writer.add_scalar("Time/Reward", reward_time, episode)
+            writer.add_scalar("Time/Prep", prep_time, episode)
+            writer.add_scalar("Time/Train", train_time, episode)
 
-    return rng, actor, critic, np.mean(actor_losses), np.mean(critic_losses), np.mean(rewards)
+            if NUM_ORGANISMS == 1:
+                # Scalars
+                writer.add_scalar("Loss/Actor", np.array(actor_loss), episode)
+                writer.add_scalar("Loss/Critic", np.array(critic_loss), episode)
+                writer.add_scalar("Loss/Entropy", -np.array(entropy), episode)
+                writer.add_scalar("Other/Reward", np.array(rewards).mean(), episode)
+                writer.add_scalar("Other/Advantage", np.array(advantages).mean(), episode)
+                writer.add_scalar("Other/Values", np.array(all_values).mean(), episode)
+                writer.add_scalar("Other/Entropy", np.array(entropy), episode)
+
+                # Histograms
+                writer.add_histogram("Actor/Logits", np.array(logits).squeeze(), episode)
+                writer.add_histogram(
+                    "Actor/Probabilities", np.array(probabilities).squeeze(), episode
+                )
+                writer.add_histogram(
+                    "Actor/Log Probabilities", np.array(log_probabilities).squeeze(), episode
+                )
+                writer.add_histogram(
+                    "Actor/Actions",
+                    np.array(actions).astype(int).squeeze().round(),
+                    episode,
+                    bins=len(Decision),
+                )
+            else:
+                writer.add_histogram("Loss/Actor", np.array(actor_loss), episode)
+                writer.add_histogram("Loss/Critic", np.array(critic_loss), episode)
+                writer.add_histogram("Loss/Entropy", -np.array(entropy), episode)
+                writer.add_histogram("Other/Reward", np.array(rewards).mean(axis=1), episode)
+                writer.add_histogram("Other/Advantage", np.array(advantages).mean(axis=1), episode)
+                writer.add_histogram("Other/Values", np.array(all_values).mean(axis=1), episode)
+                writer.add_histogram("Other/Entropy", np.array(entropy), episode)
+
+    return actor, critic
 
 
 def main() -> None:
     actor, critic = create_agents()
-
-    values = []
-    rng = jax.random.PRNGKey(0)
-    try:
-        for e in range(EPISODES):
-            LOGGER.info(f"---- Episode {e} ----")
-            rng, actor, critic, actor_loss, critic_loss, reward = execute_episode(
-                e, rng, actor, critic
-            )
-            values.append(reward)
-
-    except KeyboardInterrupt:
-        LOGGER.info("Training Stopped")
-
-    if writer is None:
-        import matplotlib.pyplot as plt
-
-        plt.plot(values, "o")
-        plt.xlabel("Episode")
-        if SUPERVISED:
-            plt.ylabel("Loss")
-        else:
-            plt.ylabel("Average Reward")
-        plt.show()
+    actor, critic = train(actor, critic)
 
     cases = definitive_cases()
     cases[1:, 4] = np.full((cases.shape[0] - 1,), 2)
