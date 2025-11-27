@@ -27,7 +27,7 @@ NUM_ORGANISMS = 1
 SUPERVISED = False
 EPISODES = int(2e6)
 LR = 1e-5
-EPOCHS = 100
+EPOCHS = 10
 BATCH_SIZE = 512
 CLIP_RANGE = 0.2
 ENTROPY_COEFFICIENT = 0.005
@@ -36,7 +36,7 @@ ENTROPY_COEFFICIENT = 0.005
 try:
     from torch.utils.tensorboard import SummaryWriter
 
-    writer = SummaryWriter(log_dir="test/tensorboard")
+    writer = SummaryWriter(log_dir="test/tensorboard2")
     print("Logging to test/tensorboard")
 
 except ImportError:
@@ -147,26 +147,23 @@ def correct_decision(environments: np.ndarray) -> np.ndarray:
 
 
 def actor_loss_fn(
-    params: dict,
-    x: ArrayLike,
-    y: ArrayLike,
-    actor_apply_fn: Callable,
-    actions: ArrayLike,
-    advantages: ArrayLike,
-    old_log_probabilities: ArrayLike,
+    params: dict, x: ArrayLike, y: ArrayLike, actor_apply_fn: Callable
 ) -> tuple[ArrayLike, ArrayLike]:
+    # Deconstruct y array
+    actions = y[:, 0].astype(int)
+    advantages = y[:, 1]
+    old_action_log_probabilities = y[:, 2]
+
     # Get the output of the actor
     logits = actor_apply_fn({"params": params}, x)
     log_probabilities = jax.nn.log_softmax(logits)
     probabilities = jnp.exp(log_probabilities)
-    action_log_probabilities = jnp.take_along_axis(log_probabilities, actions, axis=-1)
+    action_log_probabilities = jnp.take_along_axis(
+        log_probabilities, actions[:, None], axis=-1
+    ).squeeze()
 
     # Ratio between old and new policy, should be one at the first iteration
-    old_action_log_probabilities = jnp.take_along_axis(old_log_probabilities, actions, axis=-1)
     ratio = jnp.exp(action_log_probabilities - old_action_log_probabilities)
-
-    # Normalize advantage
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     # clipped surrogate loss
     policy_loss_1 = advantages * ratio
@@ -273,7 +270,7 @@ def execute_episode(
     logits = actor.predict(states)
     log_probabilities = jax.nn.log_softmax(logits)
     probabilities = jnp.exp(log_probabilities)
-    entropy = -(log_probabilities * probabilities).sum(axis=-1).mean()
+    entropy = -(log_probabilities * probabilities).sum(axis=-1).mean(axis=-1)
 
     # Sample actions in acordance with action probabilities
     rng, _rng = jax.random.split(rng)
@@ -288,19 +285,21 @@ def execute_episode(
     actions = actions.reshape(NUM_ORGANISMS, BATCH_SIZE, 1)
     rewards = rewards.reshape(NUM_ORGANISMS, BATCH_SIZE, 1)
 
+    # Standardize advantage
+    advantage_mean = advantages.mean(axis=1, keepdims=True)
+    advantage_std = advantages.std(axis=1, keepdims=True)
+    std_advantages = (advantages - advantage_mean) / (advantage_std + 1e-8)
+
+    # Prepare data for loss function
+    action_log_probabilities = jnp.take_along_axis(log_probabilities, actions, axis=-1)
+    y = jnp.concatenate((actions, std_advantages, action_log_probabilities), axis=2)
+
     actor_losses = []
     critic_losses = []
     all_values = []
     for _ in range(EPOCHS):
         # Reinforcement
-        actor, actor_loss, _ = actor.train(
-            states,
-            advantages,
-            actor_loss_fn,
-            actions=actions,
-            advantages=advantages,
-            old_log_probabilities=log_probabilities,
-        )
+        actor, actor_loss, _ = actor.train(states, y, actor_loss_fn)
         critic, critic_loss, values = critic.train(states, rewards, mse)
 
         actor_losses.append(actor_loss)
@@ -308,24 +307,36 @@ def execute_episode(
         all_values.append(values)
 
     if writer is not None:
-        writer.add_scalar("Loss/Actor", np.array(actor_loss), episode)
-        writer.add_scalar("Loss/Critic", np.array(critic_loss), episode)
-        writer.add_scalar("Loss/Entropy", -np.array(entropy), episode)
-        writer.add_scalar("Other/Reward", np.array(rewards).mean(), episode)
-        writer.add_scalar("Other/Advantage", np.array(advantages).mean(), episode)
-        writer.add_scalar("Other/Values", np.array(all_values).mean(), episode)
-        writer.add_scalar("Other/Entropy", np.array(entropy), episode)
-        writer.add_histogram("Actor/Logits", np.array(logits).squeeze(), episode)
-        writer.add_histogram("Actor/Probabilities", np.array(probabilities).squeeze(), episode)
-        writer.add_histogram(
-            "Actor/Log Probabilities", np.array(log_probabilities).squeeze(), episode
-        )
-        writer.add_histogram(
-            "Actor/Actions",
-            np.array(actions).astype(int).squeeze().round(),
-            episode,
-            bins=len(Decision),
-        )
+        if NUM_ORGANISMS == 1:
+            # Scalars
+            writer.add_scalar("Loss/Actor", np.array(actor_loss), episode)
+            writer.add_scalar("Loss/Critic", np.array(critic_loss), episode)
+            writer.add_scalar("Loss/Entropy", -np.array(entropy), episode)
+            writer.add_scalar("Other/Reward", np.array(rewards).mean(), episode)
+            writer.add_scalar("Other/Advantage", np.array(advantages).mean(), episode)
+            writer.add_scalar("Other/Values", np.array(all_values).mean(), episode)
+            writer.add_scalar("Other/Entropy", np.array(entropy), episode)
+
+            # Histograms
+            writer.add_histogram("Actor/Logits", np.array(logits).squeeze(), episode)
+            writer.add_histogram("Actor/Probabilities", np.array(probabilities).squeeze(), episode)
+            writer.add_histogram(
+                "Actor/Log Probabilities", np.array(log_probabilities).squeeze(), episode
+            )
+            writer.add_histogram(
+                "Actor/Actions",
+                np.array(actions).astype(int).squeeze().round(),
+                episode,
+                bins=len(Decision),
+            )
+        else:
+            writer.add_histogram("Loss/Actor", np.array(actor_loss), episode)
+            writer.add_histogram("Loss/Critic", np.array(critic_loss), episode)
+            writer.add_histogram("Loss/Entropy", -np.array(entropy), episode)
+            writer.add_histogram("Other/Reward", np.array(rewards).mean(axis=1), episode)
+            writer.add_histogram("Other/Advantage", np.array(advantages).mean(axis=1), episode)
+            writer.add_histogram("Other/Values", np.array(all_values).mean(axis=1), episode)
+            writer.add_histogram("Other/Entropy", np.array(entropy), episode)
 
     return rng, actor, critic, np.mean(actor_losses), np.mean(critic_losses), np.mean(rewards)
 
