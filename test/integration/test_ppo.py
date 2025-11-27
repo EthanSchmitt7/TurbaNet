@@ -381,6 +381,22 @@ def create_random_states(swarm_size: int, batch_size: int) -> np.ndarray:
     return states
 
 
+def create_random_states_fast(key, swarm_size: int, batch_size: int) -> jnp.ndarray:
+    # Random integers 0..3
+    key, subkey = jax.random.split(key)
+    states = jax.random.randint(subkey, (swarm_size, batch_size, 9), 0, 4)
+
+    # Random for center tile
+    key, subkey = jax.random.split(key)
+    rnd = jax.random.uniform(subkey, (swarm_size, batch_size))
+    states = states.at[..., 4].set(jnp.where(rnd < 0.8, 2, 3))
+
+    return states, key
+
+
+create_random_states_fast = jax.jit(create_random_states_fast, static_argnums=(1, 2))
+
+
 def get_reward(state: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
     correct = jit_correct_decision(state)
     reward = jnp.take_along_axis(correct, action, axis=-1)
@@ -396,7 +412,7 @@ def train(
         LOGGER.info(f"---- Episode {episode} ----")
         # Create random environment states and get the correct decisions
         start = perf_counter()
-        states = create_random_states(NUM_ORGANISMS, BATCH_SIZE)
+        states, rng = create_random_states_fast(rng, NUM_ORGANISMS, BATCH_SIZE)
         state_time = perf_counter() - start
 
         # Get the action probabilities
