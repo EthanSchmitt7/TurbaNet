@@ -22,12 +22,12 @@ LOGGER = logging.getLogger("turba")
 LOG_LEVEL = logging.INFO
 
 # Parameters
-NUM_ORGANISMS = 1
+NUM_ORGANISMS = int(1e3)
 
 # Training Parameters
 SUPERVISED = False
 EPISODES = int(2e6)
-LR = 1e-5
+LR = 1e-2
 EPOCHS = 10
 BATCH_SIZE = 512
 CLIP_RANGE = 0.2
