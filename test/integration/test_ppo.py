@@ -168,6 +168,136 @@ def correct_decision(environments: np.ndarray) -> np.ndarray:
     return answers
 
 
+def batched_correct_decision(environments: jnp.ndarray) -> jnp.ndarray:
+    """
+    environments: (num_orgs, batch_size, 9)
+    returns:      (num_orgs, batch_size, len(Decision))
+    """
+    num_orgs, batch_size, _ = environments.shape
+    num_decisions = len(Decision)
+
+    answered = np.full((num_orgs, batch_size), False, dtype=bool)
+    answers = np.full((num_orgs, batch_size, num_decisions), -0.1, dtype=float)
+
+    # Case 1: current cell has food+organism -> eat
+    eat = environments[..., 4] == Tile.food_organism.value  # now 3
+    answers[eat, Decision.eat.value] = 2.0
+    answered[eat] = True
+
+    # Case 2: adjacent plain food (Tile.food)
+    up = environments[..., 1] == Tile.food.value
+    left = environments[..., 3] == Tile.food.value
+    right = environments[..., 5] == Tile.food.value
+    down = environments[..., 7] == Tile.food.value
+
+    mask = np.logical_and(up, ~answered)
+    answers[mask, Decision.up.value] = 1.0
+
+    mask = np.logical_and(left, ~answered)
+    answers[mask, Decision.left.value] = 1.0
+
+    mask = np.logical_and(right, ~answered)
+    answers[mask, Decision.right.value] = 1.0
+
+    mask = np.logical_and(down, ~answered)
+    answers[mask, Decision.down.value] = 1.0
+
+    answered[up] = True
+    answered[left] = True
+    answered[right] = True
+    answered[down] = True
+
+    # Case 3: adjacent food+organism (Tile.food_organism == 3)
+    up = environments[..., 1] == Tile.food_organism.value
+    left = environments[..., 3] == Tile.food_organism.value
+    right = environments[..., 5] == Tile.food_organism.value
+    down = environments[..., 7] == Tile.food_organism.value
+
+    mask = np.logical_and(up, ~answered)
+    answers[mask, Decision.up.value] = 1.0
+
+    mask = np.logical_and(left, ~answered)
+    answers[mask, Decision.left.value] = 1.0
+
+    mask = np.logical_and(right, ~answered)
+    answers[mask, Decision.right.value] = 1.0
+
+    mask = np.logical_and(down, ~answered)
+    answers[mask, Decision.down.value] = 1.0
+
+    answered[up] = True
+    answered[left] = True
+    answered[right] = True
+    answered[down] = True
+
+    # Final fallback: if still unanswered, enable move options
+    unanswered = ~answered
+    answers[unanswered, Decision.up.value] = 1.0
+    answers[unanswered, Decision.left.value] = 1.0
+    answers[unanswered, Decision.right.value] = 1.0
+    answers[unanswered, Decision.down.value] = 1.0
+
+    return answers
+
+
+# Precompute decision indices (4 directions)
+_dir_decs = jnp.array(
+    [Decision.up.value, Decision.left.value, Decision.right.value, Decision.down.value],
+    dtype=jnp.int32,
+)
+
+
+@jax.jit
+def jit_correct_decision(environments: jnp.ndarray) -> jnp.ndarray:
+    """
+    JIT-compatible version of your batched_correct_decision function.
+    Preserves sequential mask logic exactly.
+    """
+    num_orgs, batch_size, _ = environments.shape
+    num_decisions = len(Decision)
+
+    answers = jnp.full((num_orgs, batch_size, num_decisions), -0.1, dtype=jnp.float32)
+    answered = jnp.zeros((num_orgs, batch_size), dtype=bool)
+
+    # --- Case 1: eat center ---
+    eat_mask = environments[..., 4] == Tile.food_organism.value
+    answers = answers.at[..., Decision.eat.value].set(
+        jnp.where(eat_mask, 2.0, answers[..., Decision.eat.value])
+    )
+    answered = answered | eat_mask
+
+    # --- Helper function to update neighbors ---
+    def update_neighbors(answers, answered, neigh_indices, tile_value, reward):
+        """
+        answers: (num_orgs, batch, num_decisions)
+        answered: (num_orgs, batch)
+        neigh_indices: indices of neighbors to check (1,3,5,7)
+        tile_value: value to check for in environments
+        reward: reward to assign
+        """
+        new_answered = answered
+        for i, dec_idx in enumerate(_dir_decs):
+            mask = (environments[..., neigh_indices[i]] == tile_value) & (~answered)
+            answers = answers.at[..., dec_idx].set(jnp.where(mask, reward, answers[..., dec_idx]))
+            new_answered = new_answered | mask
+        return answers, new_answered
+
+    # --- Case 2: adjacent plain food ---
+    answers, answered = update_neighbors(answers, answered, [1, 3, 5, 7], Tile.food.value, 1.0)
+
+    # --- Case 3: adjacent food+organism ---
+    answers, answered = update_neighbors(
+        answers, answered, [1, 3, 5, 7], Tile.food_organism.value, 1.0
+    )
+
+    # --- Case 4: fallback moves ---
+    unresolved = ~answered
+    for dec_idx in _dir_decs:
+        answers = answers.at[..., dec_idx].set(jnp.where(unresolved, 1.0, answers[..., dec_idx]))
+
+    return answers
+
+
 def actor_loss_fn(
     params: dict, x: ArrayLike, y: ArrayLike, actor_apply_fn: Callable
 ) -> tuple[ArrayLike, ArrayLike]:
@@ -252,7 +382,7 @@ def create_random_states(swarm_size: int, batch_size: int) -> np.ndarray:
 
 
 def get_reward(state: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
-    correct = correct_decision(state)
+    correct = jit_correct_decision(state)
     reward = jnp.take_along_axis(correct, action, axis=-1)
 
     return reward
