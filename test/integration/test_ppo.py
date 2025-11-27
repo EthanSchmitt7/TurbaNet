@@ -212,11 +212,12 @@ class Actor(nn.Module):
     @nn.compact
     def __call__(self, x):  # noqa: ANN001, ANN204
         for _ in range(self.hidden_layers):
-            x = nn.Dense(
-                self.hidden_size, kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2))
-            )(x)
+            # kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2))
+            x = nn.Dense(self.hidden_size)(x)
             x = nn.tanh(x)
-        x = nn.Dense(self.output_size, kernel_init=jax.nn.initializers.orthogonal(self.gain))(x)
+
+        # kernel_init=jax.nn.initializers.orthogonal(self.gain)
+        x = nn.Dense(self.output_size)(x)
         return x  # noqa: RET504
 
 
@@ -227,7 +228,7 @@ class Critic(Actor):
 def create_agents() -> tuple[TurbaTrainState, TurbaTrainState, TurbaTrainState]:
     # Decision Making | Policy Network | Actor
     actor = TurbaTrainState.swarm(
-        Actor(hidden_layers=2, output_size=len(Decision)),
+        Actor(hidden_layers=1, hidden_size=8, output_size=len(Decision)),
         optimizer=optax.adam(LR),
         swarm_size=NUM_ORGANISMS,
         sample_input=np.zeros((1, 9)),
@@ -235,7 +236,7 @@ def create_agents() -> tuple[TurbaTrainState, TurbaTrainState, TurbaTrainState]:
 
     # Reward Prediction | Value Network | Critic
     critic = TurbaTrainState.swarm(
-        Critic(hidden_layers=2),
+        Critic(hidden_layers=1, hidden_size=8),
         optimizer=optax.adam(LR),
         swarm_size=NUM_ORGANISMS,
         sample_input=np.zeros((1, 9)),
