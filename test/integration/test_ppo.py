@@ -158,6 +158,7 @@ def correct_decision(environments: np.ndarray) -> np.ndarray:
     answered[up] = True
     answered[left] = True
     answered[right] = True
+    answered[down] = True
 
     # Add move options if no food is nearby
     answers[~answered, Decision.up.value] = 1.0
