@@ -2,6 +2,7 @@
 scratchpad*
 data*
 .vscode*
+test/tensorboard/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
