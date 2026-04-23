@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import logging
-from enum import Enum
-from time import perf_counter
+from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING
 
+import distrax
+import gymnasium as gym
 import jax
 import jax.numpy as jnp
+import jax.random as jr
 import numpy as np
 import optax
 from flax import linen as nn
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import EvalCallback
+from torch import roll
 
-from turbanet import TurbaTrainState, mse
+from turbanet import TurbaTrainState
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -21,522 +27,354 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger("turba")
 LOG_LEVEL = logging.INFO
 
-# Parameters
-NUM_ORGANISMS = int(1e3)
-
-# Training Parameters
-SUPERVISED = False
-EPISODES = int(2e6)
-LR = 1e-2
+TOTAL_STEPS = 1e7
+NUM_NETWORKS = 1
+LR = 3e-4
 EPOCHS = 10
-BATCH_SIZE = 512
+ROLLOUT_LENGTH = 1000
+BATCH_SIZE = 1000
 CLIP_RANGE = 0.2
-ENTROPY_COEFFICIENT = 0.005
+ENTROPY_COEFFICIENT = 0.01
+CRITIC_COEFFICIENT = 0.5
+GAMMA = 0.99
+GAE_LAMBDA = 0.95
 
-# Logging
-try:
-    from torch.utils.tensorboard import SummaryWriter
-
-    writer = SummaryWriter(log_dir="test/tensorboard")
-    print("Logging to test/tensorboard")
-
-except ImportError:
-    writer = None
-    print("Torch not installed, tensorboard logging disabled")
-# Configure RNGs
-np.random.seed(0)
+EVAL_FREQ = 1000
+EVAL_EPISODES = 3
 
 
-class Decision(Enum):
-    idle = 0
-    left = 1
-    right = 2
-    up = 3
-    down = 4
-    eat = 5
+@dataclass
+class EpisodeData:
+    steps: int = 0
+    observations = jnp.empty((0, 4))
+    actions = jnp.empty((0, 1))
+    log_probabilities = jnp.empty((0, 1))
+    rewards = jnp.empty((0, 1))
+    values = jnp.empty((0, 1))
+    terminated = jnp.empty((0, 1))
+    truncated = jnp.empty((0, 1))
 
-    def __str__(self) -> str:
-        return self.name
+    def add_step(
+        self,
+        observation: ArrayLike,
+        action: ArrayLike,
+        log_probabilities: ArrayLike,
+        reward: ArrayLike,
+        value: ArrayLike,
+        terminated: ArrayLike,
+        truncated: ArrayLike,
+    ) -> None:
+        self.steps += 1
+        self.observations = np.append(self.observations, observation.reshape(1, 4), axis=0)
+        self.log_probabilities = np.append(self.log_probabilities, log_probabilities)
+        self.actions = np.append(self.actions, action)
+        self.rewards = np.append(self.rewards, reward)
+        self.values = np.append(self.values, value)
+        self.terminated = np.append(self.terminated, terminated)
+        self.truncated = np.append(self.truncated, truncated)
 
+    @property
+    def total_reward(self) -> ArrayLike:
+        return jnp.sum(self.rewards).item()
 
-class Tile(Enum):
-    invalid = -1
-    empty = 0
-    food = 1
-    organism = 2
-    food_organism = 3
+    @property
+    def is_terminated(self) -> bool:
+        return jnp.any(self.terminated).item()
 
-    def __str__(self) -> str:
-        return self.name
+    @property
+    def is_truncated(self) -> bool:
+        return jnp.any(self.truncated).item()
 
-
-def definitive_cases() -> np.ndarray:
-    environment = np.zeros((5, 9))
-    environment[0, 4] = Tile.food_organism.value  # Eat
-    environment[1, 1] = Tile.food.value  # Up
-    environment[2, 3] = Tile.food.value  # Left
-    environment[3, 5] = Tile.food.value  # Right
-    environment[4, 7] = Tile.food.value  # Down
-    return environment
-
-
-def subjective_cases() -> np.ndarray:
-    environment = np.zeros((11, 9))
-    environment[0, 1] = Tile.invalid.value  # Down/Right/Left
-    environment[1, 3] = Tile.invalid.value  # Right/Up/Down
-    environment[2, 5] = Tile.invalid.value  # Left/Up/Down
-    environment[3, 7] = Tile.invalid.value  # Up/Right/Left
-
-    # Up/Down/Left/Right
-    environment[4, 1] = Tile.food.value
-    environment[4, 3] = Tile.food.value
-    environment[4, 5] = Tile.food.value
-    environment[4, 7] = Tile.food.value
-
-    # Up/Down
-    environment[5, 1] = Tile.food.value
-    environment[5, 7] = Tile.food.value
-
-    # Right/Left
-    environment[6, 3] = Tile.food.value
-    environment[6, 5] = Tile.food.value
-
-    # Up/Right
-    environment[7, 1] = Tile.food.value
-    environment[7, 5] = Tile.food.value
-
-    # Down/Left
-    environment[8, 3] = Tile.food.value
-    environment[8, 7] = Tile.food.value
-
-    # Up/Left
-    environment[9, 1] = Tile.food.value
-    environment[9, 3] = Tile.food.value
-
-    # Down/Right
-    environment[10, 5] = Tile.food.value
-    environment[10, 7] = Tile.food.value
-
-    return environment
+    def compute_advantage(self, gamma: float = 0.99, gae_lambda: float = 0.95) -> None:
+        self.advantages, self.returns = compute_gae(
+            self.rewards, self.values, self.terminated, self.truncated, gamma, gae_lambda
+        )
 
 
-def correct_decision(environments: np.ndarray) -> np.ndarray:
-    answered = np.full(environments.shape[0], fill_value=False, dtype=bool)
-    answers = np.full((environments.shape[0], len(Decision)), fill_value=-0.1)
+@dataclass
+class RolloutData:
+    episodes: list[EpisodeData] = None
 
-    # If the current cell has food, tell the organism to eat
-    eat = environments[:, 4] == Tile.food_organism.value
-    answers[eat, Decision.eat.value] = 2.0
-    answered[eat] = True
+    def __post_init__(self) -> None:
+        self.episodes = []
 
-    # If nearby cells have food and no other organisms, move towards food
-    up = environments[:, 1] == Tile.food.value
-    left = environments[:, 3] == Tile.food.value
-    right = environments[:, 5] == Tile.food.value
-    down = environments[:, 7] == Tile.food.value
+    def add_episode(self, episode: EpisodeData) -> None:
+        self.episodes.append(episode)
 
-    answers[np.logical_and(up, ~answered), Decision.up.value] = 1.0
-    answers[np.logical_and(left, ~answered), Decision.left.value] = 1.0
-    answers[np.logical_and(right, ~answered), Decision.right.value] = 1.0
-    answers[np.logical_and(down, ~answered), Decision.down.value] = 1.0
+    def __getitem__(self, index: int) -> EpisodeData:
+        return self.episodes[index]
 
-    answered[up] = True
-    answered[left] = True
-    answered[right] = True
-    answered[down] = True
+    def as_batch(self) -> tuple[ArrayLike, tuple[ArrayLike, ...]]:
+        """Concatenate all episodes into flat arrays ready for training"""
+        observations = jnp.concatenate([e.observations for e in self.episodes])
+        actions = jnp.concatenate([e.actions for e in self.episodes])
+        log_probabilities = jnp.concatenate([e.log_probabilities for e in self.episodes])
+        values = jnp.concatenate([e.values for e in self.episodes])
+        advantages = jnp.concatenate([e.advantages for e in self.episodes])
+        returns = jnp.concatenate([e.returns for e in self.episodes])
 
-    # If nearby cells have food and other organisms, move towards food
-    up = environments[:, 1] == Tile.food_organism.value
-    left = environments[:, 3] == Tile.food_organism.value
-    right = environments[:, 5] == Tile.food_organism.value
-    down = environments[:, 7] == Tile.food_organism.value
+        # TODO: Should be done at minibatch level - Standardize advantage
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        self.advantages = advantages
 
-    answers[np.logical_and(up, ~answered), Decision.up.value] = 1.0
-    answers[np.logical_and(left, ~answered), Decision.left.value] = 1.0
-    answers[np.logical_and(right, ~answered), Decision.right.value] = 1.0
-    answers[np.logical_and(down, ~answered), Decision.down.value] = 1.0
+        return (
+            jnp.array(observations),
+            jnp.array(
+                [
+                    jnp.array(actions),
+                    jnp.array(log_probabilities),
+                    jnp.array(values),
+                    jnp.array(advantages),
+                    jnp.array(returns),
+                ]
+            ),
+        )
 
-    answered[up] = True
-    answered[left] = True
-    answered[right] = True
-    answered[down] = True
+    @property
+    def mean_episode_return(self) -> float:
+        return np.mean([e.returns for e in self.episodes])
 
-    # Add move options if no food is nearby
-    answers[~answered, Decision.up.value] = 1.0
-    answers[~answered, Decision.left.value] = 1.0
-    answers[~answered, Decision.right.value] = 1.0
-    answers[~answered, Decision.down.value] = 1.0
+    @property
+    def total_steps(self) -> int:
+        return sum(e.steps for e in self.episodes)
 
-    return answers
-
-
-def batched_correct_decision(environments: jnp.ndarray) -> jnp.ndarray:
-    """
-    environments: (num_orgs, batch_size, 9)
-    returns:      (num_orgs, batch_size, len(Decision))
-    """
-    num_orgs, batch_size, _ = environments.shape
-    num_decisions = len(Decision)
-
-    answered = np.full((num_orgs, batch_size), False, dtype=bool)
-    answers = np.full((num_orgs, batch_size, num_decisions), -0.1, dtype=float)
-
-    # Case 1: current cell has food+organism -> eat
-    eat = environments[..., 4] == Tile.food_organism.value  # now 3
-    answers[eat, Decision.eat.value] = 2.0
-    answered[eat] = True
-
-    # Case 2: adjacent plain food (Tile.food)
-    up = environments[..., 1] == Tile.food.value
-    left = environments[..., 3] == Tile.food.value
-    right = environments[..., 5] == Tile.food.value
-    down = environments[..., 7] == Tile.food.value
-
-    mask = np.logical_and(up, ~answered)
-    answers[mask, Decision.up.value] = 1.0
-
-    mask = np.logical_and(left, ~answered)
-    answers[mask, Decision.left.value] = 1.0
-
-    mask = np.logical_and(right, ~answered)
-    answers[mask, Decision.right.value] = 1.0
-
-    mask = np.logical_and(down, ~answered)
-    answers[mask, Decision.down.value] = 1.0
-
-    answered[up] = True
-    answered[left] = True
-    answered[right] = True
-    answered[down] = True
-
-    # Case 3: adjacent food+organism (Tile.food_organism == 3)
-    up = environments[..., 1] == Tile.food_organism.value
-    left = environments[..., 3] == Tile.food_organism.value
-    right = environments[..., 5] == Tile.food_organism.value
-    down = environments[..., 7] == Tile.food_organism.value
-
-    mask = np.logical_and(up, ~answered)
-    answers[mask, Decision.up.value] = 1.0
-
-    mask = np.logical_and(left, ~answered)
-    answers[mask, Decision.left.value] = 1.0
-
-    mask = np.logical_and(right, ~answered)
-    answers[mask, Decision.right.value] = 1.0
-
-    mask = np.logical_and(down, ~answered)
-    answers[mask, Decision.down.value] = 1.0
-
-    answered[up] = True
-    answered[left] = True
-    answered[right] = True
-    answered[down] = True
-
-    # Final fallback: if still unanswered, enable move options
-    unanswered = ~answered
-    answers[unanswered, Decision.up.value] = 1.0
-    answers[unanswered, Decision.left.value] = 1.0
-    answers[unanswered, Decision.right.value] = 1.0
-    answers[unanswered, Decision.down.value] = 1.0
-
-    return answers
+    @property
+    def num_episodes(self) -> int:
+        return len(self.episodes)
 
 
-# Precompute decision indices (4 directions)
-_dir_decs = jnp.array(
-    [Decision.up.value, Decision.left.value, Decision.right.value, Decision.down.value],
-    dtype=jnp.int32,
-)
+class ActorCritic(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        # Shared trunk
+        x = nn.Dense(64)(x)
+        x = nn.tanh(x)
+        x = nn.Dense(64)(x)
+        x = nn.tanh(x)
+
+        # Actor head - outputs logits over actions
+        logits = nn.Dense(2)(x)  # 2 actions: left, right
+
+        # Critic head - outputs scalar value
+        value = nn.Dense(1)(x)
+
+        return logits, value
 
 
-@jax.jit
-def jit_correct_decision(environments: jnp.ndarray) -> jnp.ndarray:
-    """
-    JIT-compatible version of your batched_correct_decision function.
-    Preserves sequential mask logic exactly.
-    """
-    num_orgs, batch_size, _ = environments.shape
-    num_decisions = len(Decision)
+def compute_gae(
+    rewards: ArrayLike,
+    values: ArrayLike,
+    terminated: ArrayLike,
+    truncated: ArrayLike,
+    gamma: float,
+    gae_lambda: float,
+) -> tuple[ArrayLike, ArrayLike]:
+    # Bootstrap value for final state
+    final_value = values[-1] * (1.0 - terminated[-1])
 
-    answers = jnp.full((num_orgs, batch_size, num_decisions), -0.1, dtype=jnp.float32)
-    answered = jnp.zeros((num_orgs, batch_size), dtype=bool)
+    def scan_fn(carry, inputs):
+        r, v, v_next, term, trunc = inputs
+        # Zero out future if terminated, bootstrap if truncated
+        next_value = v_next * (1.0 - term)
+        delta = r + gamma * next_value - v
+        advantage = delta + gamma * gae_lambda * carry * (1.0 - term)
+        return advantage, advantage
 
-    # --- Case 1: eat center ---
-    eat_mask = environments[..., 4] == Tile.food_organism.value
-    answers = answers.at[..., Decision.eat.value].set(
-        jnp.where(eat_mask, 2.0, answers[..., Decision.eat.value])
-    )
-    answered = answered | eat_mask
+    # Need next values for each step
+    next_values = jnp.concatenate([values[1:], final_value[None]])
 
-    # --- Helper function to update neighbors ---
-    def update_neighbors(answers, answered, neigh_indices, tile_value, reward):
-        """
-        answers: (num_orgs, batch, num_decisions)
-        answered: (num_orgs, batch)
-        neigh_indices: indices of neighbors to check (1,3,5,7)
-        tile_value: value to check for in environments
-        reward: reward to assign
-        """
-        new_answered = answered
-        for i, dec_idx in enumerate(_dir_decs):
-            mask = (environments[..., neigh_indices[i]] == tile_value) & (~answered)
-            answers = answers.at[..., dec_idx].set(jnp.where(mask, reward, answers[..., dec_idx]))
-            new_answered = new_answered | mask
-        return answers, new_answered
+    inputs = (rewards, values, next_values, terminated, truncated)
+    inputs_rev = jax.tree_util.tree_map(jnp.flip, inputs)
 
-    # --- Case 2: adjacent plain food ---
-    answers, answered = update_neighbors(answers, answered, [1, 3, 5, 7], Tile.food.value, 1.0)
+    _, advantages_rev = jax.lax.scan(scan_fn, 0.0, inputs_rev)
+    advantages = jnp.flip(advantages_rev)
 
-    # --- Case 3: adjacent food+organism ---
-    answers, answered = update_neighbors(
-        answers, answered, [1, 3, 5, 7], Tile.food_organism.value, 1.0
-    )
+    # Returns for value function target
+    returns = advantages + values
 
-    # --- Case 4: fallback moves ---
-    unresolved = ~answered
-    for dec_idx in _dir_decs:
-        answers = answers.at[..., dec_idx].set(jnp.where(unresolved, 1.0, answers[..., dec_idx]))
-
-    return answers
+    return advantages, returns
 
 
-def actor_loss_fn(
-    params: dict, x: ArrayLike, y: ArrayLike, actor_apply_fn: Callable
+gae_vmap = jax.vmap(compute_gae, in_axes=(0, 0, 0, 0, None, None))
+
+
+def ppo_loss(
+    params: dict, x: ArrayLike, y: ArrayLike, apply_fn: Callable
 ) -> tuple[ArrayLike, ArrayLike]:
     # Deconstruct y array
-    actions = y[:, 0].astype(int)
-    advantages = y[:, 1]
-    old_action_log_probabilities = y[:, 2]
+    actions = y[0]
+    old_log_probabilities = y[1]
+    old_values = y[2]
+    advantages = y[3]
+    returns = y[4]
 
-    # Get the output of the actor
-    logits = actor_apply_fn({"params": params}, x)
-    log_probabilities = jax.nn.log_softmax(logits)
-    probabilities = jnp.exp(log_probabilities)
-    action_log_probabilities = jnp.take_along_axis(
-        log_probabilities, actions[..., None], axis=-1
-    ).squeeze()
+    # Query the actor-critic network
+    new_logits, new_values = apply_fn({"params": params}, x)
+    new_values = new_values.squeeze(-1)
+
+    # Get new log probabilities
+    dist = distrax.Categorical(logits=new_logits)
+    new_log_probabilities = dist.log_prob(actions)
 
     # Ratio between old and new policy, should be one at the first iteration
-    ratio = jnp.exp(action_log_probabilities - old_action_log_probabilities)
+    ratio = jnp.exp(new_log_probabilities - old_log_probabilities)
 
-    # clipped surrogate loss
+    # Clipped surrogate loss
     policy_loss_1 = advantages * ratio
     policy_loss_2 = advantages * jnp.clip(ratio, 1 - CLIP_RANGE, 1 + CLIP_RANGE)
     policy_loss = -jnp.mean(jnp.minimum(policy_loss_1, policy_loss_2))
 
+    # Critic loss
+    values_clipped = old_values + jnp.clip(new_values - old_values, -CLIP_RANGE, CLIP_RANGE)
+    critic_loss = jnp.mean(
+        jnp.maximum((new_values - returns) ** 2, (values_clipped - returns) ** 2)
+    )
+
     # Adding entropy to encourage exploration
-    entropy = -(log_probabilities * probabilities).sum(axis=-1).mean()
-    entropy_loss = -entropy
+    entropy_loss = dist.entropy().mean()
 
     # Total loss
-    loss = policy_loss + ENTROPY_COEFFICIENT * entropy_loss
+    loss = policy_loss + CRITIC_COEFFICIENT * critic_loss - ENTROPY_COEFFICIENT * entropy_loss
 
-    return loss, logits
-
-
-class Actor(nn.Module):
-    hidden_layers: int = 1
-    hidden_size: int = 64
-    output_size: int = 1
-    gain: float = 0.01
-
-    @nn.compact
-    def __call__(self, x):  # noqa: ANN001, ANN204
-        for _ in range(self.hidden_layers):
-            # kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2))
-            x = nn.Dense(self.hidden_size)(x)
-            x = nn.tanh(x)
-
-        # kernel_init=jax.nn.initializers.orthogonal(self.gain)
-        x = nn.Dense(self.output_size)(x)
-        return x  # noqa: RET504
+    return loss, new_logits
 
 
-class Critic(Actor):
-    gain = 1.0
-
-
-def create_agents() -> tuple[TurbaTrainState, TurbaTrainState, TurbaTrainState]:
-    # Decision Making | Policy Network | Actor
-    actor = TurbaTrainState.swarm(
-        Actor(hidden_layers=1, hidden_size=8, output_size=len(Decision)),
-        optimizer=optax.adam(LR),
-        swarm_size=NUM_ORGANISMS,
-        sample_input=np.zeros((1, 9)),
-    )
-
-    # Reward Prediction | Value Network | Critic
-    critic = TurbaTrainState.swarm(
-        Critic(hidden_layers=1, hidden_size=8),
-        optimizer=optax.adam(LR),
-        swarm_size=NUM_ORGANISMS,
-        sample_input=np.zeros((1, 9)),
-    )
-
-    return actor, critic
-
-
-def create_random_states(swarm_size: int, batch_size: int) -> np.ndarray:
-    states = np.random.randint(0, 4, (swarm_size, batch_size, 9))
-    states[..., 4] = np.random.choice((2, 3), (swarm_size, batch_size), p=(0.8, 0.2))
-
-    return states
-
-
-def create_random_states_fast(key, swarm_size: int, batch_size: int) -> jnp.ndarray:
-    # Random integers 0..3
-    key, subkey = jax.random.split(key)
-    states = jax.random.randint(subkey, (swarm_size, batch_size, 9), 0, 4)
-
-    # Random for center tile
-    key, subkey = jax.random.split(key)
-    rnd = jax.random.uniform(subkey, (swarm_size, batch_size))
-    states = states.at[..., 4].set(jnp.where(rnd < 0.8, 2, 3))
-
-    return states, key
-
-
-create_random_states_fast = jax.jit(create_random_states_fast, static_argnums=(1, 2))
-
-
-def get_reward(state: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
-    correct = jit_correct_decision(state)
-    reward = jnp.take_along_axis(correct, action, axis=-1)
-
-    return reward
-
-
-def train(
-    actor: TurbaTrainState, critic: TurbaTrainState
-) -> tuple[TurbaTrainState, TurbaTrainState]:
-    rng = jax.random.PRNGKey(0)
-    for episode in range(EPISODES):
-        LOGGER.info(f"---- Episode {episode} ----")
-        # Create random environment states and get the correct decisions
-        start = perf_counter()
-        states, rng = create_random_states_fast(rng, NUM_ORGANISMS, BATCH_SIZE)
-        state_time = perf_counter() - start
-
-        # Get the action probabilities
-        start = perf_counter()
-        logits = actor.predict(states)
-        log_probabilities = jax.nn.log_softmax(logits)
-        probabilities = jnp.exp(log_probabilities)
-        entropy = -(log_probabilities * probabilities).sum(axis=-1).mean(axis=-1)
-
-        # Sample actions in acordance with action probabilities
-        rng, _rng = jax.random.split(rng)
-        actions = jax.random.categorical(_rng, logits, shape=(NUM_ORGANISMS, BATCH_SIZE))[
-            ..., None
-        ]
-        action_time = perf_counter() - start
-
-        # Get the reward
-        start = perf_counter()
-        rewards = get_reward(states, actions)
-        predicted_reward = critic.predict(states)
-
-        # Calculate advantage for each organism
-        advantages = rewards - predicted_reward
-
-        # Standardize advantage
-        advantage_mean = advantages.mean(axis=1, keepdims=True)
-        advantage_std = advantages.std(axis=1, keepdims=True)
-        std_advantages = (advantages - advantage_mean) / (advantage_std + 1e-8)
-        reward_time = perf_counter() - start
-
-        # Prepare data for loss function
-        start = perf_counter()
-        action_log_probabilities = jnp.take_along_axis(log_probabilities, actions, axis=-1)
-        y = jnp.concatenate((actions, std_advantages, action_log_probabilities), axis=2)
-        prep_time = perf_counter() - start
-
-        start = perf_counter()
-        actor_losses = []
-        critic_losses = []
-        all_values = []
-        for _ in range(EPOCHS):
-            # Reinforcement
-            actor, actor_loss, _ = actor.train(states, y, actor_loss_fn)
-            critic, critic_loss, values = critic.train(states, rewards, mse)
-
-            actor_losses.append(actor_loss)
-            critic_losses.append(critic_loss)
-            all_values.append(values)
-
-        train_time = perf_counter() - start
-
-        if writer is not None:
-            writer.add_scalar("Time/State", state_time, episode)
-            writer.add_scalar("Time/Action", action_time, episode)
-            writer.add_scalar("Time/Reward", reward_time, episode)
-            writer.add_scalar("Time/Prep", prep_time, episode)
-            writer.add_scalar("Time/Train", train_time, episode)
-
-            if NUM_ORGANISMS == 1:
-                # Scalars
-                writer.add_scalar("Loss/Actor", np.array(actor_loss), episode)
-                writer.add_scalar("Loss/Critic", np.array(critic_loss), episode)
-                writer.add_scalar("Loss/Entropy", -np.array(entropy), episode)
-                writer.add_scalar("Other/Reward", np.array(rewards).mean(), episode)
-                writer.add_scalar("Other/Advantage", np.array(advantages).mean(), episode)
-                writer.add_scalar("Other/Values", np.array(all_values).mean(), episode)
-                writer.add_scalar("Other/Entropy", np.array(entropy), episode)
-
-                # Histograms
-                writer.add_histogram("Actor/Logits", np.array(logits).squeeze(), episode)
-                writer.add_histogram(
-                    "Actor/Probabilities", np.array(probabilities).squeeze(), episode
-                )
-                writer.add_histogram(
-                    "Actor/Log Probabilities", np.array(log_probabilities).squeeze(), episode
-                )
-                writer.add_histogram(
-                    "Actor/Actions",
-                    np.array(actions).astype(int).squeeze().round(),
-                    episode,
-                    bins=len(Decision),
-                )
-            else:
-                writer.add_histogram("Loss/Actor", np.array(actor_loss), episode)
-                writer.add_histogram("Loss/Critic", np.array(critic_loss), episode)
-                writer.add_histogram("Loss/Entropy", -np.array(entropy), episode)
-                writer.add_histogram("Other/Reward", np.array(rewards).mean(axis=1), episode)
-                writer.add_histogram("Other/Advantage", np.array(advantages).mean(axis=1), episode)
-                writer.add_histogram("Other/Values", np.array(all_values).mean(axis=1), episode)
-                writer.add_histogram("Other/Entropy", np.array(entropy), episode)
-
-    return actor, critic
+ppo_loss_fn = jax.jit(jax.vmap(ppo_loss, in_axes=(0, 0, 0, None)), static_argnames=("apply_fn",))
 
 
 def main() -> None:
-    actor, critic = create_agents()
-    actor, critic = train(actor, critic)
+    # Training Environment
+    env = gym.make_vec("CartPole-v1", num_envs=NUM_NETWORKS)
+    obs, info = env.reset()
 
-    cases = definitive_cases()
-    cases[1:, 4] = np.full((cases.shape[0] - 1,), 2)
-    logits = actor.predict(cases)
-    print("Definitive Cases")
-    for logits, case in zip(logits[0], cases):
-        print(f"\nCase: \n{case.reshape(3, 3)}")
-        probabilities = jnp.exp(logits) / jnp.sum(jnp.exp(logits), axis=-1, keepdims=True)
+    # Test Environment
+    eval_env = gym.make("CartPole-v1", render_mode="human")
 
-        for p, d in zip(probabilities, Decision._member_names_):
-            print(f"{d}: {np.round(p, 2) * 100:.2f}%")
+    # Network
+    optimizer = optax.adam(3e-4)
+    # optimizer = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(3e-4))
+    network = TurbaTrainState.swarm(
+        ActorCritic(),
+        optimizer=optimizer,
+        swarm_size=NUM_NETWORKS,
+        sample_input=jnp.zeros((1, 4)),
+    )
 
-    cases = subjective_cases()
-    cases[:, 4] = np.full((cases.shape[0],), 2)
-    logits = actor.predict(cases)
-    print("\nSubjective Cases")
-    for logits, case in zip(logits[0], cases):
-        print(f"\nCase: \n{case.reshape(3, 3)}")
-        probabilities = jnp.exp(logits) / jnp.sum(jnp.exp(logits), axis=-1, keepdims=True)
+    # Initialize RNG
+    key = jr.PRNGKey(0)
 
-        for p, d in zip(probabilities, Decision._member_names_):
-            print(f"{d}: {np.round(p, 2) * 100:.2f}%")
+    iteration = 0
+    while iteration < TOTAL_STEPS:
+        # Training
+        for _ in range(EVAL_FREQ):
+            iteration += 1
 
-    if writer is not None:
-        writer.close()
+            # Initialization
+            rollout_data = RolloutData()
+            episode = EpisodeData()
+            episode.add_step(obs, 0, 0, 0, 0, False, False)
+
+            # Rollout
+            for i in range(ROLLOUT_LENGTH):
+                logit, value = network.predict(obs)
+
+                dist = distrax.Categorical(logits=logit)
+                key, subkey = jr.split(key)
+                action = dist.sample(seed=subkey)
+                log_probability = dist.log_prob(action)
+
+                obs, reward, term, trunc, info = env.step(np.array(action))
+
+                if i == ROLLOUT_LENGTH - 1:
+                    trunc = True
+
+                episode.add_step(obs, action, log_probability, reward, value, term, trunc)
+                if term or trunc:
+                    rollout_data.add_episode(episode)
+                    episode.compute_advantage(GAMMA, GAE_LAMBDA)
+
+                    obs, info = env.reset()
+                    episode = EpisodeData()
+
+            # Get rollout data for training
+            x, y = rollout_data.as_batch()
+
+            # Update
+            for _ in range(EPOCHS):
+                network, loss, _ = network.train(x, y, ppo_loss)
+
+            mean_episode_reward = np.mean(
+                [episode.total_reward for episode in rollout_data.episodes]
+            )
+            LOGGER.info(
+                f"Step: {iteration} | "
+                f"Average Loss: {loss.mean():.4f} | "
+                f"Average Reward: {mean_episode_reward:.4f}"
+            )
+
+            # explained_var = explained_variance(
+            #     self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten()
+            # )
+            # explained_var = np.nan if var_y == 0 else float(1 - np.var(y_true - y_pred) / var_y)
+
+            # # Logs
+            # self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+            # self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
+            # self.logger.record("train/value_loss", np.mean(value_losses))
+            # self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+            # self.logger.record("train/clip_fraction", np.mean(clip_fractions))
+            # self.logger.record("train/loss", loss.item())
+            # self.logger.record("train/explained_variance", explained_var)
+            # if hasattr(self.policy, "log_std"):
+            #     self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
+
+            # self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+            # self.logger.record("train/clip_range", clip_range)
+
+        # Evaluation
+        for _ in range(EVAL_EPISODES):
+            obs, info = eval_env.reset()
+
+            term = False
+            trunc = False
+            while not term or not trunc:
+                logit, value = network.predict(obs)
+
+                dist = distrax.Categorical(logits=logit)
+                key, subkey = jr.split(key)
+                action = dist.sample(seed=subkey)
+
+                obs, reward, term, trunc, info = eval_env.step(np.array(action[0]))
+
+
+def train_sb3_cartpole():
+    env = gym.make("CartPole-v1")
+
+    model = PPO(
+        "MlpPolicy",
+        env,
+        learning_rate=LR,
+        n_steps=ROLLOUT_LENGTH,  # rollout length
+        batch_size=BATCH_SIZE,
+        n_epochs=EPOCHS,  # epochs per update
+        gamma=GAMMA,
+        gae_lambda=GAE_LAMBDA,
+        clip_range=CLIP_RANGE,
+        ent_coef=ENTROPY_COEFFICIENT,  # entropy coefficient
+        vf_coef=CRITIC_COEFFICIENT,  # critic coefficient
+        verbose=1,
+    )
+
+    eval_env = gym.make("CartPole-v1", render_mode="human")
+    eval_callback = EvalCallback(
+        eval_env,
+        eval_freq=EVAL_FREQ * ROLLOUT_LENGTH,
+        n_eval_episodes=EVAL_EPISODES,
+        verbose=1,
+    )
+
+    model.learn(total_timesteps=TOTAL_STEPS, callback=eval_callback)
+    return model
 
 
 if __name__ == "__main__":
