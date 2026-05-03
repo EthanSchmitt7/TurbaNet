@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from functools import cached_property
 from typing import TYPE_CHECKING
 
 import distrax
@@ -15,9 +14,12 @@ import optax
 from flax import linen as nn
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import EvalCallback
-from torch import roll
+from torch.utils.tensorboard import SummaryWriter
 
 from turbanet import TurbaTrainState
+
+writer = SummaryWriter()
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -32,8 +34,9 @@ NUM_NETWORKS = 1
 LR = 3e-4
 EPOCHS = 10
 ROLLOUT_LENGTH = 1000
-BATCH_SIZE = 1000
+BATCH_SIZE = 2000
 CLIP_RANGE = 0.2
+CLIP_RANGE_VF = 0.2
 ENTROPY_COEFFICIENT = 0.01
 CRITIC_COEFFICIENT = 0.5
 GAMMA = 0.99
@@ -143,20 +146,70 @@ class RolloutData:
         return len(self.episodes)
 
 
+from flax import nnx
+
+
+class Test(nnx.Module):
+    def __init__(self, *, rngs: nnx.Rngs):
+        self.pi = []
+        self.pi.append(
+            nnx.Linear(4, 64, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)), rngs=rngs)
+        )
+        self.pi.append(
+            nnx.Linear(64, 64, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)), rngs=rngs)
+        )
+
+        self.vf = []
+        self.vf.append(
+            nnx.Linear(4, 64, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)), rngs=rngs)
+        )
+        self.vf.append(
+            nnx.Linear(64, 64, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)), rngs=rngs)
+        )
+
+        self.actor_head = nnx.Linear(
+            64, 2, kernel_init=nn.initializers.orthogonal(0.01), rngs=rngs
+        )
+        self.critic_head = nnx.Linear(64, 1, kernel_init=nn.initializers.orthogonal(), rngs=rngs)
+
+    def __call__(self, x):
+        # Actor
+        pi_x = x
+        for p_layer in self.pi:
+            pi_x = nnx.tanh(p_layer(pi_x))
+
+        logits = self.actor_head(pi_x)
+
+        # Critic
+        vf_x = x
+        for v_layer in self.vf:
+            vf_x = nnx.tanh(v_layer(vf_x))
+
+        value = self.critic_head(vf_x)
+
+        return logits, value
+
+
 class ActorCritic(nn.Module):
     @nn.compact
     def __call__(self, x):
-        # Shared trunk
-        x = nn.Dense(64)(x)
-        x = nn.tanh(x)
-        x = nn.Dense(64)(x)
-        x = nn.tanh(x)
+        # Policy Extractor
+        pi_x = nn.Dense(64, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(x)
+        pi_x = nn.tanh(pi_x)
+        pi_x = nn.Dense(64, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(pi_x)
+        pi_x = nn.tanh(pi_x)
 
-        # Actor head - outputs logits over actions
-        logits = nn.Dense(2)(x)  # 2 actions: left, right
+        # Value Extractor
+        vf_x = nn.Dense(64, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(x)
+        vf_x = nn.tanh(vf_x)
+        vf_x = nn.Dense(64, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(vf_x)
+        vf_x = nn.tanh(vf_x)
 
-        # Critic head - outputs scalar value
-        value = nn.Dense(1)(x)
+        # Actor head - outputs logits over actions (Action Net)
+        logits = nn.Dense(2, kernel_init=nn.initializers.orthogonal(0.01))(pi_x)
+
+        # Critic head - outputs scalar value (Value Net)
+        value = nn.Dense(1, kernel_init=nn.initializers.orthogonal())(vf_x)
 
         return logits, value
 
@@ -169,27 +222,23 @@ def compute_gae(
     gamma: float,
     gae_lambda: float,
 ) -> tuple[ArrayLike, ArrayLike]:
-    # Bootstrap value for final state
-    final_value = values[-1] * (1.0 - terminated[-1])
+    # Convert to numpy
+    last_values = values[-1]
 
-    def scan_fn(carry, inputs):
-        r, v, v_next, term, trunc = inputs
-        # Zero out future if terminated, bootstrap if truncated
-        next_value = v_next * (1.0 - term)
-        delta = r + gamma * next_value - v
-        advantage = delta + gamma * gae_lambda * carry * (1.0 - term)
-        return advantage, advantage
+    last_gae_lam = 0
+    buffer_size = len(rewards)
+    advantages = jnp.zeros(shape=values.shape)
+    for step in reversed(range(buffer_size)):
+        if step == buffer_size - 1:
+            next_non_terminal = 1.0 - terminated[step]
+            next_values = last_values
+        else:
+            next_non_terminal = 1.0
+            next_values = values[step + 1]
+        delta = rewards[step] + gamma * next_values * next_non_terminal - values[step]
+        last_gae_lam = delta + gamma * gae_lambda * next_non_terminal * last_gae_lam
+        advantages = advantages.at[step].set(last_gae_lam)
 
-    # Need next values for each step
-    next_values = jnp.concatenate([values[1:], final_value[None]])
-
-    inputs = (rewards, values, next_values, terminated, truncated)
-    inputs_rev = jax.tree_util.tree_map(jnp.flip, inputs)
-
-    _, advantages_rev = jax.lax.scan(scan_fn, 0.0, inputs_rev)
-    advantages = jnp.flip(advantages_rev)
-
-    # Returns for value function target
     returns = advantages + values
 
     return advantages, returns
@@ -230,11 +279,22 @@ def ppo_loss(
         jnp.maximum((new_values - returns) ** 2, (values_clipped - returns) ** 2)
     )
 
+    # Critic loss
+    # No clipping
+    values_pred = new_values
+
+    # # Vf Clipping
+    # # NOTE: this depends on the reward scaling
+    # values_pred = old_values + jnp.clip(new_values - old_values, -CLIP_RANGE_VF, CLIP_RANGE_VF)
+
+    # Value loss using the TD(gae_lambda) target
+    critic_loss = jnp.mean((returns - values_pred) ** 2)
+
     # Adding entropy to encourage exploration
-    entropy_loss = dist.entropy().mean()
+    entropy_loss = -dist.entropy().mean()
 
     # Total loss
-    loss = policy_loss + CRITIC_COEFFICIENT * critic_loss - ENTROPY_COEFFICIENT * entropy_loss
+    loss = policy_loss + CRITIC_COEFFICIENT * critic_loss + ENTROPY_COEFFICIENT * entropy_loss
 
     return loss, new_logits
 
@@ -242,17 +302,65 @@ def ppo_loss(
 ppo_loss_fn = jax.jit(jax.vmap(ppo_loss, in_axes=(0, 0, 0, None)), static_argnames=("apply_fn",))
 
 
+def debug_loss(params, x, y, apply_fn):
+    # Deconstruct y array
+    actions = y[0]
+    old_log_probabilities = y[1]
+    old_values = y[2]
+    advantages = y[3]
+    returns = y[4]
+
+    # Query the actor-critic network
+    new_logits, new_values = apply_fn({"params": params}, x)
+    new_values = new_values.squeeze(-1)
+
+    # Get new log probabilities
+    dist = distrax.Categorical(logits=new_logits)
+    new_log_probabilities = dist.log_prob(actions)
+
+    # Ratio between old and new policy, should be one at the first iteration
+    ratio = jnp.exp(new_log_probabilities - old_log_probabilities)
+
+    # Clipped surrogate loss
+    policy_loss_1 = advantages * ratio
+    policy_loss_2 = advantages * jnp.clip(ratio, 1 - CLIP_RANGE, 1 + CLIP_RANGE)
+    policy_loss = -jnp.mean(jnp.minimum(policy_loss_1, policy_loss_2))
+
+    # Clip Fraction
+    clip_fraction = jnp.mean((jnp.abs(ratio - 1) > CLIP_RANGE))
+
+    # KL Divergence
+    log_ratio = new_log_probabilities - old_log_probabilities
+    approx_kl_div = jnp.mean((jnp.exp(log_ratio) - 1) - log_ratio)
+
+    # Critic loss
+    # No clipping
+    values_pred = new_values
+
+    # # Vf Clipping
+    # # NOTE: this depends on the reward scaling
+    # values_pred = old_values + jnp.clip(new_values - old_values, -CLIP_RANGE_VF, CLIP_RANGE_VF)
+
+    # Value loss using the TD(gae_lambda) target
+    critic_loss = jnp.mean((returns - values_pred) ** 2)
+
+    # Adding entropy to encourage exploration
+    entropy_loss = -dist.entropy().mean()
+
+    return policy_loss, critic_loss, entropy_loss, clip_fraction, approx_kl_div
+
+
 def main() -> None:
     # Training Environment
-    env = gym.make_vec("CartPole-v1", num_envs=NUM_NETWORKS)
+    env = gym.make("CartPole-v1")
     obs, info = env.reset()
 
     # Test Environment
     eval_env = gym.make("CartPole-v1", render_mode="human")
 
     # Network
-    optimizer = optax.adam(3e-4)
-    # optimizer = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(3e-4))
+    # optimizer = optax.adam(3e-4)
+    optimizer = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(3e-4))
     network = TurbaTrainState.swarm(
         ActorCritic(),
         optimizer=optimizer,
@@ -275,7 +383,7 @@ def main() -> None:
             episode.add_step(obs, 0, 0, 0, 0, False, False)
 
             # Rollout
-            for i in range(ROLLOUT_LENGTH):
+            for i in range(ROLLOUT_LENGTH - 1):
                 logit, value = network.predict(obs)
 
                 dist = distrax.Categorical(logits=logit)
@@ -283,7 +391,7 @@ def main() -> None:
                 action = dist.sample(seed=subkey)
                 log_probability = dist.log_prob(action)
 
-                obs, reward, term, trunc, info = env.step(np.array(action))
+                obs, reward, term, trunc, info = env.step(np.array(action[0]))
 
                 if i == ROLLOUT_LENGTH - 1:
                     trunc = True
@@ -299,25 +407,41 @@ def main() -> None:
             # Get rollout data for training
             x, y = rollout_data.as_batch()
 
+            # TODO: Remove after debugging
+            p_loss, c_loss, e_loss, clip_fraction, approx_kl_div = debug_loss(
+                network.get_state(0).params, x, y, network.get_state(0).apply_fn
+            )
+            writer.add_scalar("train/policy_loss", p_loss.item(), iteration * BATCH_SIZE)
+            writer.add_scalar("train/critic_loss", c_loss.item(), iteration * BATCH_SIZE)
+            writer.add_scalar("train/entropy_loss", e_loss.item(), iteration * BATCH_SIZE)
+            writer.add_scalar("train/clip_fraction", clip_fraction.item(), iteration * BATCH_SIZE)
+            writer.add_scalar("train/approx_kl_div", approx_kl_div.item(), iteration * BATCH_SIZE)
+
             # Update
             for _ in range(EPOCHS):
                 network, loss, _ = network.train(x, y, ppo_loss)
 
-            mean_episode_reward = np.mean(
-                [episode.total_reward for episode in rollout_data.episodes]
-            )
+            ep_mean_reward = np.mean([episode.total_reward for episode in rollout_data.episodes])
             LOGGER.info(
-                f"Step: {iteration} | "
+                f"Iteration: {iteration} | "
+                f"Steps: {iteration * ROLLOUT_LENGTH} | "
                 f"Average Loss: {loss.mean():.4f} | "
-                f"Average Reward: {mean_episode_reward:.4f}"
+                f"Average Reward: {ep_mean_reward:.4f}"
             )
 
-            # explained_var = explained_variance(
-            #     self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten()
-            # )
-            # explained_var = np.nan if var_y == 0 else float(1 - np.var(y_true - y_pred) / var_y)
+            var_y = np.var(y[4])
+            explained_variance = np.nan if var_y == 0 else float(1 - np.var(y[4] - y[2]) / var_y)
+
+            ep_len_mean = np.mean([episode.steps for episode in rollout_data.episodes])
 
             # # Logs
+            writer.add_scalar("rollout/ep_len_mean", ep_len_mean, iteration * BATCH_SIZE)
+            writer.add_scalar("rollout/ep_mean_reward", ep_mean_reward, iteration * BATCH_SIZE)
+            writer.add_scalar("train/total_loss", loss.item(), iteration * BATCH_SIZE)
+            writer.add_scalar(
+                "train/explained_variance", explained_variance, iteration * BATCH_SIZE
+            )
+
             # self.logger.record("train/entropy_loss", np.mean(entropy_losses))
             # self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
             # self.logger.record("train/value_loss", np.mean(value_losses))
@@ -330,6 +454,7 @@ def main() -> None:
 
             # self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
             # self.logger.record("train/clip_range", clip_range)
+            writer.flush()
 
         # Evaluation
         for _ in range(EVAL_EPISODES):
@@ -363,6 +488,7 @@ def train_sb3_cartpole():
         ent_coef=ENTROPY_COEFFICIENT,  # entropy coefficient
         vf_coef=CRITIC_COEFFICIENT,  # critic coefficient
         verbose=1,
+        tensorboard_log="./ppo_cartpole_tensorboard/",
     )
 
     eval_env = gym.make("CartPole-v1", render_mode="human")

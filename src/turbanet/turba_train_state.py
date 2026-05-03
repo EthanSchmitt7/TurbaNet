@@ -45,38 +45,36 @@ def create_fn(
 create = jax.vmap(create_fn, in_axes=(None, None, None, 0))
 
 
-def train_fn(
-    state: TurbaTrainState,
-    input: ArrayImpl,
-    output: ArrayImpl,
-    loss_fn: Callable[[dict, dict, Callable], tuple[ArrayImpl, ArrayImpl]],
-    **kwargs: dict,
-) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
-    """Train for a single step.
+def make_train_step(loss_fn):
+    def train_fn(
+        state: TurbaTrainState, input: ArrayImpl, output: ArrayImpl
+    ) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
+        """Train for a single step.
 
-    Args:
-        state: The current `TurbaTrainState` object.
-        input: The input to the model.
-        output: The output of the model.
-        loss_fn: The loss function to use.
+        Args:
+            state: The current `TurbaTrainState` object.
+            input: The input to the model.
+            output: The output of the model.
+            loss_fn: The loss function to use.
 
-    Returns:
-        tuple[TurbaTrainState, ArrayImpl, ArrayImpl]: The updated
-            (state, loss, prediction).
-    """
+        Returns:
+            tuple[TurbaTrainState, ArrayImpl, ArrayImpl]: The updated
+                (state, loss, prediction).
+        """
 
-    def wrapped_loss_fn(
-        params: dict, input: ArrayImpl, output: ArrayImpl, **kwargs
-    ) -> tuple[ArrayImpl, ArrayImpl]:
-        return loss_fn(params, input, output, state.apply_fn, **kwargs)
+        chex.assert_max_traces(n=10)
 
-    grad_fn = jax.value_and_grad(wrapped_loss_fn, has_aux=True)
-    (loss, prediction), grads = grad_fn(state.params, input, output, **kwargs)
-    state = state.apply_gradients(grads=grads)
-    return state, loss, prediction
+        def wrapped_loss_fn(params: dict) -> tuple[ArrayImpl, ArrayImpl]:
+            return loss_fn(params, input, output, state.apply_fn)
 
+        grad_fn = jax.value_and_grad(wrapped_loss_fn, has_aux=True)
+        (loss, prediction), grads = grad_fn(state.params)
+        new_state = state.apply_gradients(grads=grads)
+        return new_state, loss, prediction
 
-train = jax.jit(jax.vmap(train_fn, in_axes=(0, 0, 0, None)), static_argnames=("loss_fn",))
+    train = jax.jit(jax.vmap(train_fn))
+
+    return train
 
 
 def predict_fn(state: TurbaTrainState, input: ArrayImpl) -> ArrayImpl:
@@ -252,7 +250,9 @@ class TurbaTrainState(TrainState):
         if not isinstance(output_data, jnp.ndarray):
             output_data = jnp.asarray(output_data)
 
-        return train(self, input_data, output_data, loss_fn, **kwargs)
+        _train = make_train_step(loss_fn)
+
+        return _train(self, input_data, output_data)
 
     def cost_analysis(self, input: ArrayImpl) -> dict:
         return (
@@ -269,7 +269,7 @@ class TurbaTrainState(TrainState):
         return tuple(list(first_kernel[0:2]) + [last_kernel[-1]])
 
     def __len__(self) -> int:
-        return len(self.opt_state[0].count)
+        return list(self.params.values())[0]["kernel"].shape[0]
 
     @jax.jit
     def __add__(self: TurbaTrainState, other: TurbaTrainState) -> TurbaTrainState:
