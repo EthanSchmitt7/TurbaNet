@@ -1,6 +1,5 @@
 from datetime import datetime
-from functools import partial
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import flax.linen as nn
 import gymnasium as gym
@@ -10,17 +9,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optax
 import torch
-from flax.training.train_state import TrainState
 from stable_baselines3 import PPO as SB3PPO
 from stable_baselines3.common.callbacks import BaseCallback
+
+from turbanet.turba_train_state import TurbaTrainState
 
 # Initialize random number generators
 SEED = 42
 SOLVE_THRESHOLD = 475
+CLIP_RANGE = 0.2
+VF_COEFFICIENT = 0.5
+ENTROPY_COEFFICIENT = 0.0
 np.random.seed(SEED)
 
 
-# Jax PPO
+# Jax PPO Structures
 class PPOConfig(NamedTuple):
     lr: float = 3e-4
     n_steps: int = 2048  # rollout steps per env per update
@@ -39,7 +42,7 @@ class PPOConfig(NamedTuple):
 class PPOState(NamedTuple):
     """Everything that changes across updates, passed explicitly."""
 
-    train_state: TrainState  # flax TrainState (params + opt)
+    train_state: TurbaTrainState  # flax TurbaTrainState (params + opt)
     rng: jax.Array  # PRNG key
     episode_rewards: list  # mutable list – appended in rollout
     timestep_log: list  # matching global-step for each ep
@@ -58,30 +61,50 @@ class RolloutBuffer(NamedTuple):
     next_obs: np.ndarray  # (E, obs_dim) – carry-over for next rollout
 
 
-@jax.jit
-def infer(train_state: TrainState, observation: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Forward pass → (logits, values). JIT-compiled."""
-    return train_state.apply_fn({"params": train_state.params}, observation)
+# Loss function
+def ppo_loss(
+    params: dict, x: jax.Array, y: jax.Array, apply_fn: Callable
+) -> tuple[jax.Array, jax.Array]:
+    # Unpack output array
+    actions = y[:, 0].astype(int)
+    old_action_lp = y[:, 1]
+    advantages = y[:, 2]
+    returns = y[:, 3]
+
+    # Query the current policy
+    logits, values = apply_fn({"params": params}, x)
+    log_probabilities = jax.nn.log_softmax(logits)
+    new_action_lp = log_probabilities[jnp.arange(len(actions)), actions]
+
+    # Compute ratio between old and new policy
+    ratio = jnp.exp(new_action_lp - old_action_lp)
+
+    # Policy loss (Clip surrogate loss)
+    policy_loss = jnp.mean(
+        jnp.maximum(
+            -advantages * ratio,
+            -advantages * jnp.clip(ratio, 1 - CLIP_RANGE, 1 + CLIP_RANGE),
+        )
+    )
+
+    # Value loss (MSE)
+    value_loss = 0.5 * jnp.mean((values - returns) ** 2)
+
+    # Entropy loss
+    probabilities = jax.nn.softmax(logits)
+    entropy_loss = -jnp.sum(probabilities * log_probabilities, axis=-1).mean()
+
+    # Total loss
+    loss = policy_loss + VF_COEFFICIENT * value_loss - ENTROPY_COEFFICIENT * entropy_loss
+    return (loss, (policy_loss, value_loss, entropy_loss))
 
 
-def sample_actions(rng: jax.Array, logits: np.ndarray) -> tuple[jax.Array, np.ndarray, np.ndarray]:
-    """
-    Sample from logits, return (actions, log_probs) as numpy arrays.
-    Numerically stable log-softmax done in numpy.
-    """
-    rng, key = jax.random.split(rng)
-    actions = np.array(jax.random.categorical(key, jnp.array(logits)))
-    shifted = logits - logits.max(axis=1, keepdims=True)
-    log_probs_all = shifted - np.log(np.exp(shifted).sum(axis=1, keepdims=True))
-    log_probs = log_probs_all[np.arange(len(actions)), actions]
-    return rng, actions, log_probs
-
-
+# Network Configs
 class ActorCritic(nn.Module):
     n_actions: int
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
         x = nn.Dense(64)(x)
         x = nn.tanh(x)
         x = nn.Dense(64)(x)
@@ -114,6 +137,43 @@ class DualEncoderActorCritic(nn.Module):
         return logits, value
 
 
+# Utility functions
+def compute_gae(
+    rewards: np.ndarray,
+    values: np.ndarray,
+    dones: np.ndarray,
+    last_values: np.ndarray,
+    gamma: float,
+    gae_lambda: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generalised Advantage Estimation over (T, E) arrays."""
+    T, E = rewards.shape
+    advantages = np.zeros_like(rewards)
+    last_gae = np.zeros(E, dtype=np.float32)
+    for t in reversed(range(T)):
+        next_value = last_values if t == T - 1 else values[t + 1]
+        mask = 1.0 - dones[t]
+        delta = rewards[t] + gamma * next_value * mask - values[t]
+        last_gae = delta + gamma * gae_lambda * mask * last_gae
+        advantages[t] = last_gae
+    returns = advantages + values
+    return advantages, returns
+
+
+def sample_actions(rng: jax.Array, logits: np.ndarray) -> tuple[jax.Array, np.ndarray, np.ndarray]:
+    """
+    Sample from logits, return (actions, log_probs) as numpy arrays.
+    Numerically stable log-softmax done in numpy.
+    """
+    rng, key = jax.random.split(rng)
+    actions = np.array(jax.random.categorical(key, jnp.array(logits)))
+    shifted = logits - logits.max(axis=1, keepdims=True)
+    log_probs_all = shifted - np.log(np.exp(shifted).sum(axis=1, keepdims=True))
+    log_probs = log_probs_all[np.arange(len(actions)), actions]
+    return rng, actions, log_probs
+
+
+# Run simulation
 def collect_rollout(
     state: PPOState, envs: list, cfg: PPOConfig, obs: np.ndarray
 ) -> tuple[PPOState, RolloutBuffer]:
@@ -141,7 +201,7 @@ def collect_rollout(
     # Run rollout
     for t in range(T):
         # Forward pass to get logits/values for current observation
-        logits, values = infer(state.train_state, jnp.array(current_observation))
+        logits, values = state.train_state.predict(jnp.array(current_observation))
         logits = np.array(logits)
         values = np.array(values)
 
@@ -184,7 +244,7 @@ def collect_rollout(
         current_observation = next_observation
 
     # Compute last values
-    _, last_values = infer(state.train_state, jnp.array(current_observation))
+    _, last_values = state.train_state.predict(jnp.array(current_observation))
     last_values = np.array(last_values)
 
     # Create buffer
@@ -211,67 +271,7 @@ def collect_rollout(
     return new_state, buffer
 
 
-def compute_gae(
-    rewards: np.ndarray,
-    values: np.ndarray,
-    dones: np.ndarray,
-    last_values: np.ndarray,
-    gamma: float,
-    gae_lambda: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Generalised Advantage Estimation over (T, E) arrays."""
-    T, E = rewards.shape
-    advantages = np.zeros_like(rewards)
-    last_gae = np.zeros(E, dtype=np.float32)
-    for t in reversed(range(T)):
-        next_value = last_values if t == T - 1 else values[t + 1]
-        mask = 1.0 - dones[t]
-        delta = rewards[t] + gamma * next_value * mask - values[t]
-        last_gae = delta + gamma * gae_lambda * mask * last_gae
-        advantages[t] = last_gae
-    returns = advantages + values
-    return advantages, returns
-
-
-@partial(jax.jit, static_argnums=(2,))
-def minibatch_update(
-    train_state: TrainState, batch: tuple, cfg: PPOConfig
-) -> tuple[TrainState, jax.Array]:
-    observations, actions, old_action_lp, advantages, returns = batch
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-    def loss_fn(params):
-        # Query the current policy
-        logits, values = train_state.apply_fn({"params": params}, observations)
-        log_probabilities = jax.nn.log_softmax(logits)
-        new_action_lp = log_probabilities[jnp.arange(len(actions)), actions]
-
-        # Compute ratio between old and new policy
-        ratio = jnp.exp(new_action_lp - old_action_lp)
-
-        # Policy loss (Clip surrogate loss)
-        policy_loss = jnp.mean(
-            jnp.maximum(
-                -advantages * ratio,
-                -advantages * jnp.clip(ratio, 1 - cfg.clip_range, 1 + cfg.clip_range),
-            )
-        )
-
-        # Value loss (MSE)
-        value_loss = 0.5 * jnp.mean((values - returns) ** 2)
-
-        # Entropy loss
-        probabilities = jax.nn.softmax(logits)
-        entropy_loss = -jnp.sum(probabilities * log_probabilities, axis=-1).mean()
-
-        # Total loss
-        loss = policy_loss + cfg.vf_coef * value_loss - cfg.ent_coef * entropy_loss
-        return (loss, (policy_loss, value_loss, entropy_loss))
-
-    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(train_state.params)
-    return train_state.apply_gradients(grads=grads), loss, aux
-
-
+# Gradient updates
 def run_update(state: PPOState, buffer: RolloutBuffer, cfg: PPOConfig) -> tuple[PPOState, float]:
     """
     Run cfg.n_epochs of minibatch PPO updates over buf.
@@ -310,8 +310,15 @@ def run_update(state: PPOState, buffer: RolloutBuffer, cfg: PPOConfig) -> tuple[
                 jnp.array(advantage_flat[b]),
                 jnp.array(return_flat[b]),
             )
-            train_state, loss, _ = minibatch_update(train_state, batch, cfg)
-            losses.append(float(loss))
+
+            observations, actions, old_action_lp, advantages, returns = batch
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            train_state, loss, _ = train_state.train(
+                observations, jnp.array([actions, old_action_lp, advantages, returns]).T
+            )
+
+            losses.append(loss.item())
 
     new_state = PPOState(
         train_state=train_state,
@@ -329,7 +336,7 @@ def run_sb3(total_timesteps: int = 100_000) -> tuple[list, list]:
     class EpisodeRewardCallback(BaseCallback):
         """Collect per-episode rewards from SB3."""
 
-        def __init__(self):
+        def __init__(self) -> None:
             super().__init__()
             self.episode_rewards: list = []
             self.timestep_log: list = []
@@ -394,25 +401,19 @@ def run_jax_ppo(total_timesteps: int = 100_000) -> tuple[list, list]:
     n_actions = probe.action_space.n
     probe.close()
 
-    # Initialize network
+    # Initialize network/training state
     net = DualEncoderActorCritic(n_actions=n_actions)
-    rng, init_key = jax.random.split(rng)
-    params = net.init(init_key, jnp.zeros((1, obs_dim)))["params"]
-
-    # Initialize optimizer
-    tx = optax.chain(
-        optax.clip_by_global_norm(cfg.max_grad_norm),
-        optax.adam(cfg.lr, eps=1e-5),
+    ts = TurbaTrainState.swarm(
+        model=net,
+        optimizer=optax.chain(
+            optax.clip_by_global_norm(cfg.max_grad_norm),
+            optax.adam(cfg.lr, eps=1e-5),
+        ),
+        swarm_size=1,
+        input_size=obs_dim,
+        seed=SEED,
     )
-
-    # Initialize optimizer
-    tx = optax.chain(
-        optax.clip_by_global_norm(cfg.max_grad_norm),
-        optax.adam(cfg.lr, eps=1e-5),
-    )
-
-    # Initialize training state
-    ts = TrainState.create(apply_fn=net.apply, params=params, tx=tx)
+    ts = ts.set_loss_fn(ppo_loss)
 
     # Initialize PPO state
     state = PPOState(
