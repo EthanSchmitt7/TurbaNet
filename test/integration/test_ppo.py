@@ -1,7 +1,6 @@
 from datetime import datetime
-from typing import Callable, NamedTuple
+from typing import NamedTuple
 
-import flax.linen as nn
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
@@ -12,31 +11,13 @@ import torch
 from stable_baselines3 import PPO as SB3PPO
 from stable_baselines3.common.callbacks import BaseCallback
 
+from turbanet.ppo import DualEncoderActorCritic, PPOConfig, RolloutBuffer
 from turbanet.turba_train_state import TurbaTrainState
 
 # Initialize random number generators
 SEED = 42
 SOLVE_THRESHOLD = 475
-CLIP_RANGE = 0.2
-VF_COEFFICIENT = 0.5
-ENTROPY_COEFFICIENT = 0.0
 np.random.seed(SEED)
-
-
-# Jax PPO Structures
-class PPOConfig(NamedTuple):
-    lr: float = 3e-4
-    n_steps: int = 2048  # rollout steps per env per update
-    n_envs: int = 16  # parallel envs
-    batch_size: int = 64
-    n_epochs: int = 10
-    gamma: float = 0.99
-    gae_lambda: float = 0.95
-    clip_range: float = 0.2
-    ent_coef: float = 0.0
-    vf_coef: float = 0.5
-    max_grad_norm: float = 0.5
-    total_timesteps: int = 100_000
 
 
 class PPOState(NamedTuple):
@@ -48,116 +29,6 @@ class PPOState(NamedTuple):
     timestep_log: list  # matching global-step for each ep
     episode_rewards_live: np.ndarray  # per-env running reward accumulator
     total_steps: int  # global step counter
-
-
-class RolloutBuffer(NamedTuple):
-    observations: np.ndarray  # (T, E, obs_dim)
-    actions: np.ndarray  # (T, E)
-    rewards: np.ndarray  # (T, E)
-    dones: np.ndarray  # (T, E)
-    action_lps: np.ndarray  # (T, E)
-    values: np.ndarray  # (T, E)
-    last_values: np.ndarray  # (E,)  – bootstrap values
-    next_obs: np.ndarray  # (E, obs_dim) – carry-over for next rollout
-
-
-# Loss function
-def ppo_loss(
-    params: dict, x: jax.Array, y: jax.Array, apply_fn: Callable
-) -> tuple[jax.Array, jax.Array]:
-    # Unpack output array
-    actions = y[:, 0].astype(int)
-    old_action_lp = y[:, 1]
-    advantages = y[:, 2]
-    returns = y[:, 3]
-
-    # Query the current policy
-    logits, values = apply_fn({"params": params}, x)
-    log_probabilities = jax.nn.log_softmax(logits)
-    new_action_lp = log_probabilities[jnp.arange(len(actions)), actions]
-
-    # Compute ratio between old and new policy
-    ratio = jnp.exp(new_action_lp - old_action_lp)
-
-    # Policy loss (Clip surrogate loss)
-    policy_loss = jnp.mean(
-        jnp.maximum(
-            -advantages * ratio,
-            -advantages * jnp.clip(ratio, 1 - CLIP_RANGE, 1 + CLIP_RANGE),
-        )
-    )
-
-    # Value loss (MSE)
-    value_loss = 0.5 * jnp.mean((values - returns) ** 2)
-
-    # Entropy loss
-    probabilities = jax.nn.softmax(logits)
-    entropy_loss = -jnp.sum(probabilities * log_probabilities, axis=-1).mean()
-
-    # Total loss
-    loss = policy_loss + VF_COEFFICIENT * value_loss - ENTROPY_COEFFICIENT * entropy_loss
-    return (loss, (policy_loss, value_loss, entropy_loss))
-
-
-# Network Configs
-class ActorCritic(nn.Module):
-    n_actions: int
-
-    @nn.compact
-    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
-        x = nn.Dense(64)(x)
-        x = nn.tanh(x)
-        x = nn.Dense(64)(x)
-        x = nn.tanh(x)
-        logits = nn.Dense(self.n_actions)(x)
-        value = jnp.squeeze(nn.Dense(1)(x), axis=-1)
-        return logits, value
-
-
-class DualEncoderActorCritic(nn.Module):
-    n_actions: int
-
-    @nn.compact
-    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
-        # Policy encoder
-        x_p = nn.Dense(64)(x)
-        x_p = nn.tanh(x_p)
-        x_p = nn.Dense(64)(x_p)
-        x_p = nn.tanh(x_p)
-
-        # Value encoder
-        x_v = nn.Dense(64)(x)
-        x_v = nn.tanh(x_v)
-        x_v = nn.Dense(64)(x_v)
-        x_v = nn.tanh(x_v)
-
-        logits = nn.Dense(self.n_actions)(x_p)
-        value = jnp.squeeze(nn.Dense(1)(x_v), axis=-1)
-
-        return logits, value
-
-
-# Utility functions
-def compute_gae(
-    rewards: np.ndarray,
-    values: np.ndarray,
-    dones: np.ndarray,
-    last_values: np.ndarray,
-    gamma: float,
-    gae_lambda: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Generalised Advantage Estimation over (T, E) arrays."""
-    T, E = rewards.shape
-    advantages = np.zeros_like(rewards)
-    last_gae = np.zeros(E, dtype=np.float32)
-    for t in reversed(range(T)):
-        next_value = last_values if t == T - 1 else values[t + 1]
-        mask = 1.0 - dones[t]
-        delta = rewards[t] + gamma * next_value * mask - values[t]
-        last_gae = delta + gamma * gae_lambda * mask * last_gae
-        advantages[t] = last_gae
-    returns = advantages + values
-    return advantages, returns
 
 
 def sample_actions(rng: jax.Array, logits: np.ndarray) -> tuple[jax.Array, np.ndarray, np.ndarray]:
@@ -202,8 +73,6 @@ def collect_rollout(
     for t in range(T):
         # Forward pass to get logits/values for current observation
         logits, values = state.train_state.predict(jnp.array(current_observation))
-        logits = np.array(logits)
-        values = np.array(values)
 
         # Sample actions from logits
         rng, actions, log_probabilities = sample_actions(rng, logits)
@@ -277,18 +146,11 @@ def run_update(state: PPOState, buffer: RolloutBuffer, cfg: PPOConfig) -> tuple[
     Run cfg.n_epochs of minibatch PPO updates over buf.
     Returns updated PPOState and mean loss.
     """
-    advantages, returns = compute_gae(
-        buffer.rewards,
-        buffer.values,
-        buffer.dones,
-        buffer.last_values,
-        cfg.gamma,
-        cfg.gae_lambda,
-    )
+    advantages, returns = buffer.compute_gae(cfg)
 
     # Flatten (T, E) → (N,)
     observation_flat = buffer.observations.reshape(-1, buffer.observations.shape[-1])
-    activation_flat = buffer.actions.flatten()
+    action_flat = buffer.actions.flatten()
     action_lp_flat = buffer.action_lps.flatten()
     advantage_flat = advantages.flatten()
     return_flat = returns.flatten()
@@ -303,20 +165,19 @@ def run_update(state: PPOState, buffer: RolloutBuffer, cfg: PPOConfig) -> tuple[
         idx = np.random.permutation(N)
         for start in range(0, N, cfg.batch_size):
             b = idx[start : start + cfg.batch_size]
-            batch = (
-                jnp.array(observation_flat[b]),
-                jnp.array(activation_flat[b]),
-                jnp.array(action_lp_flat[b]),
-                jnp.array(advantage_flat[b]),
-                jnp.array(return_flat[b]),
-            )
 
-            observations, actions, old_action_lp, advantages, returns = batch
+            # Get observations
+            x = observation_flat[b]
+
+            # Normalize advantages
+            advantages = advantage_flat[b]
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            train_state, loss, _ = train_state.train(
-                observations, jnp.array([actions, old_action_lp, advantages, returns]).T
-            )
+            # Pack data into array
+            y = jnp.stack([action_flat[b], action_lp_flat[b], advantages, return_flat[b]], axis=1)
+
+            # Train
+            train_state, loss, _ = train_state.train(x, y)
 
             losses.append(loss.item())
 
@@ -413,7 +274,7 @@ def run_jax_ppo(total_timesteps: int = 100_000) -> tuple[list, list]:
         input_size=obs_dim,
         seed=SEED,
     )
-    ts = ts.set_loss_fn(ppo_loss)
+    ts = ts.set_loss_fn(cfg.loss_fn)
 
     # Initialize PPO state
     state = PPOState(
@@ -511,12 +372,12 @@ def plot_comparison(jax_rewards: list, output_path: str = "test/integration/ppo.
 
 
 if __name__ == "__main__":
-    jax_results = run_jax_ppo(total_timesteps=75_000)
+    jax_results = run_jax_ppo(total_timesteps=100_000)
     plot_comparison(
         jax_results[0], f"test/integration/ppo_jax_{datetime.now().strftime('%Y%m%d%H%M%S')}.png"
     )
 
-    sb3_results = run_sb3(75_000)
+    sb3_results = run_sb3(100_000)
     plot_comparison(
         sb3_results[0], f"test/integration/ppo_sb3_{datetime.now().strftime('%Y%m%d%H%M%S')}.png"
     )
