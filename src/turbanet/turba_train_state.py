@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import flax
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -20,10 +21,7 @@ __all__ = ["TurbaTrainState"]
 
 
 def create_fn(
-    model: nn.Module,
-    optimizer: optax.GradientTransformation,
-    sample_input: ArrayImpl,
-    seed: int,
+    model: nn.Module, optimizer: optax.GradientTransformation, sample_input: ArrayImpl, seed: int
 ) -> TurbaTrainState:
     """Creates an initial `TurbaTrainState`.
 
@@ -45,7 +43,7 @@ def create_fn(
 create = jax.vmap(create_fn, in_axes=(None, None, None, 0))
 
 
-def make_train_step(loss_fn):
+def make_train_step(loss_fn: Callable) -> Callable:
     def train_fn(
         state: TurbaTrainState, input: ArrayImpl, output: ArrayImpl
     ) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
@@ -62,19 +60,15 @@ def make_train_step(loss_fn):
                 (state, loss, prediction).
         """
 
-        chex.assert_max_traces(n=10)
-
         def wrapped_loss_fn(params: dict) -> tuple[ArrayImpl, ArrayImpl]:
             return loss_fn(params, input, output, state.apply_fn)
 
         grad_fn = jax.value_and_grad(wrapped_loss_fn, has_aux=True)
-        (loss, prediction), grads = grad_fn(state.params)
+        (loss, aux), grads = grad_fn(state.params)
         new_state = state.apply_gradients(grads=grads)
-        return new_state, loss, prediction
+        return new_state, loss, aux
 
-    train = jax.jit(jax.vmap(train_fn))
-
-    return train
+    return jax.jit(jax.vmap(train_fn))
 
 
 def predict_fn(state: TurbaTrainState, input: ArrayImpl) -> ArrayImpl:
@@ -115,12 +109,15 @@ evaluate = jax.jit(jax.vmap(evaluate_fn, in_axes=(0, 0, 0, None)), static_argnam
 class TurbaTrainState(TrainState):
     """TrainState for TurbaNet."""
 
+    train_function: Callable = flax.struct.field(pytree_node=False, default=None)
+
     @staticmethod
     def swarm(
         model: nn.Module,
         optimizer: optax.GradientTransformation,
         swarm_size: int,
-        sample_input: ArrayImpl,
+        input_size: int = None,
+        sample_input: ArrayImpl = None,
         seed: ArrayImpl = None,
     ) -> TurbaTrainState:
         """Creates a swarm of initial `TurbaTrainState`s.
@@ -130,11 +127,20 @@ class TurbaTrainState(TrainState):
             optimizer: The optimizer to use.
             swarm_size: The size of the swarm.
             input_size: The size of the input.
+            sample_input: A example of an input to the network
             seed: The seed to use for initialization.
 
         Returns:
             TurbaTrainState: A `TurbaTrainState` object.
         """
+        if input_size is None and sample_input is None:
+            raise RuntimeError(
+                "'input_size' or a 'sample_input' must be provided to TurbaTrainState.swarm."
+            )
+
+        if input_size is not None:
+            sample_input = jnp.zeros((1, input_size))
+
         if seed is None:
             seed = 0
 
@@ -145,6 +151,18 @@ class TurbaTrainState(TrainState):
             raise ValueError("Seed and learning rate must be the same length as swarm_size.")
 
         return create(model, optimizer, sample_input, seed)
+
+    def set_loss_fn(self, loss_fn: Callable) -> TurbaTrainState:
+        """Sets the loss function to use.
+
+        Args:
+            loss_fn: The loss function to use.
+
+        Returns:
+            TurbaTrainState: The updated `TurbaTrainState` object.
+        """
+        # Create train step
+        return self.replace(train_function=make_train_step(loss_fn))
 
     def predict(self, input_data: np.ndarray) -> ArrayImpl:
         """Predicts on a batch of data.
@@ -212,7 +230,7 @@ class TurbaTrainState(TrainState):
         return evaluate(self, input_data, output_data, loss_fn)
 
     def train(
-        self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable, **kwargs: dict
+        self, input_data: np.ndarray, output_data: np.ndarray, **kwargs: dict
     ) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
         """Trains on a batch of data.
 
@@ -250,9 +268,7 @@ class TurbaTrainState(TrainState):
         if not isinstance(output_data, jnp.ndarray):
             output_data = jnp.asarray(output_data)
 
-        _train = make_train_step(loss_fn)
-
-        return _train(self, input_data, output_data)
+        return self.train_function(self, input_data, output_data)
 
     def cost_analysis(self, input: ArrayImpl) -> dict:
         return (
