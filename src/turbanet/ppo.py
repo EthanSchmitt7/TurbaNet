@@ -97,12 +97,13 @@ class RolloutBuffer(NamedTuple):
 # Network Configs
 class ActorCritic(nn.Module):
     n_actions: int
+    hidden_dim: int = 64
 
     @nn.compact
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
-        x = nn.Dense(64)(x)
+        x = nn.Dense(self.hidden_dim)(x)
         x = nn.tanh(x)
-        x = nn.Dense(64)(x)
+        x = nn.Dense(self.hidden_dim)(x)
         x = nn.tanh(x)
         logits = nn.Dense(self.n_actions)(x)
         value = jnp.squeeze(nn.Dense(1)(x), axis=-1)
@@ -111,19 +112,21 @@ class ActorCritic(nn.Module):
 
 class DualEncoderActorCritic(nn.Module):
     n_actions: int
+    actor_hidden: int = 16
+    critic_hidden: int = 16
 
     @nn.compact
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
         # Policy encoder
-        x_p = nn.Dense(64)(x)
+        x_p = nn.Dense(self.actor_hidden)(x)
         x_p = nn.tanh(x_p)
-        x_p = nn.Dense(64)(x_p)
+        x_p = nn.Dense(self.actor_hidden)(x_p)
         x_p = nn.tanh(x_p)
 
         # Value encoder
-        x_v = nn.Dense(64)(x)
+        x_v = nn.Dense(self.critic_hidden)(x)
         x_v = nn.tanh(x_v)
-        x_v = nn.Dense(64)(x_v)
+        x_v = nn.Dense(self.critic_hidden)(x_v)
         x_v = nn.tanh(x_v)
 
         logits = nn.Dense(self.n_actions)(x_p)
