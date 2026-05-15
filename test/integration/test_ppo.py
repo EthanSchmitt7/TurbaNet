@@ -319,8 +319,8 @@ def run_jax_ppo(total_timesteps: int = 100_000) -> tuple[list, list]:
     return state.episode_rewards, state.timestep_log
 
 
-def plot_comparison(jax_rewards: list, output_path: str = "test/integration/ppo.png") -> None:
-    final_values = np.array(jax_rewards[-max(1, int(len(jax_rewards) * 0.25)) :], dtype=np.float32)
+def plot_comparison(rewards: list, output_path: str = "test/integration/ppo.png") -> None:
+    final_values = np.array(rewards[-max(1, int(len(rewards) * 0.25)) :], dtype=np.float32)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     fig.patch.set_facecolor("#0f1117")
@@ -340,8 +340,8 @@ def plot_comparison(jax_rewards: list, output_path: str = "test/integration/ppo.
         return np.convolve(arr, np.ones(window) / window, mode="valid")
 
     # Training curves
-    ax1.plot(jax_rewards, color=color, alpha=0.18, linewidth=0.8)
-    ax1.plot(smooth(jax_rewards), color=color, linewidth=2.5, label="JAX PPO (smoothed)")
+    ax1.plot(rewards, color=color, alpha=0.18, linewidth=0.8)
+    ax1.plot(smooth(rewards), color=color, linewidth=2.5, label="JAX PPO (smoothed)")
     ax1.axhline(
         SOLVE_THRESHOLD,
         color="white",
