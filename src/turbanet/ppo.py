@@ -5,10 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-# Initialize random number generators
-SEED = 42
-SOLVE_THRESHOLD = 475
-np.random.seed(SEED)
+__all__ = ["PPOConfig", "RolloutBuffer", "ActorCritic", "DualEncoderActorCritic"]
 
 
 # Jax PPO Structures

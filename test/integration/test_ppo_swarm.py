@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optax
 
-from turbanet.ppo import ActorCritic, DualEncoderActorCritic, PPOConfig, RolloutBuffer
+from turbanet.ppo import DualEncoderActorCritic, PPOConfig, RolloutBuffer
 from turbanet.turba_train_state import TurbaTrainState
 
 # Initialize random number generators
@@ -263,7 +263,7 @@ def run_jax_ppo(total_timesteps: int = 100_000) -> tuple[list, list]:
     return state, state.episode_rewards, state.timestep_log
 
 
-def new_plot(state: PPOState) -> None:
+def plot(state: PPOState) -> None:
     rewards = []
     for t_data, r_data in zip(state.timestep_log, state.episode_rewards):
         for t, r in zip(t_data, r_data):
@@ -296,4 +296,4 @@ def new_plot(state: PPOState) -> None:
 
 if __name__ == "__main__":
     jax_results = run_jax_ppo(total_timesteps=TOTAL_TIMESTEPS)
-    new_plot(jax_results[0])
+    plot(jax_results[0])
