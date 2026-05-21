@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import flax
 import jax
@@ -20,27 +20,33 @@ if TYPE_CHECKING:
 __all__ = ["TurbaTrainState"]
 
 
+def make_params_fn(model: nn.Module, sample_input: ArrayImpl, seed: int) -> dict:
+    params = model.init(jr.PRNGKey(seed), sample_input)["params"]
+    return params
+
+
+make_params = jax.vmap(make_params_fn, in_axes=(None, None, 0))
+
+
 def create_fn(
-    model: nn.Module, optimizer: optax.GradientTransformation, sample_input: ArrayImpl, seed: int
+    apply_fn: Callable, optimizer: optax.GradientTransformation, params: dict
 ) -> TurbaTrainState:
     """Creates an initial `TurbaTrainState`.
 
     Args:
-        model: The model to train.
+        apply_fn: The apply function of the model.
         optimizer: The optimizer to use.
-        input_size: The size of the input.
-        seed: The seed to use for initialization.
+        params: The parameters of the model.
 
     Returns:
         TurbaTrainState: A `TurbaTrainState` object.
     """
 
     # initialize parameters by passing an input template
-    params = model.init(jr.PRNGKey(seed), sample_input)["params"]
-    return TurbaTrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
+    return TurbaTrainState.create(apply_fn=apply_fn, params=params, tx=optimizer)
 
 
-create = jax.vmap(create_fn, in_axes=(None, None, None, 0))
+_create = jax.vmap(create_fn, in_axes=(None, None, 0))
 
 
 def make_train_step(loss_fn: Callable) -> Callable:
@@ -111,6 +117,12 @@ class TurbaTrainState(TrainState):
 
     train_function: Callable = flax.struct.field(pytree_node=False, default=None)
 
+    @classmethod
+    def vmap_create(
+        cls, *, apply_fn: Callable, params: dict, tx: optax.GradientTransformation, **kwargs
+    ) -> TurbaTrainState:
+        return _create(apply_fn, tx, params)
+
     @staticmethod
     def swarm(
         model: nn.Module,
@@ -150,7 +162,8 @@ class TurbaTrainState(TrainState):
         if len(seed) != swarm_size:
             raise ValueError("Seed and learning rate must be the same length as swarm_size.")
 
-        return create(model, optimizer, sample_input, seed)
+        params = make_params(model, sample_input, seed)
+        return _create(model.apply, optimizer, params)
 
     def set_loss_fn(self, loss_fn: Callable) -> TurbaTrainState:
         """Sets the loss function to use.
