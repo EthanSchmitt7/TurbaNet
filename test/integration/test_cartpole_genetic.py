@@ -1,5 +1,6 @@
 from copy import copy
 from datetime import datetime
+from pathlib import Path
 from typing import NamedTuple
 
 import gymnasium as gym
@@ -8,6 +9,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
+from matplotlib.animation import FuncAnimation
 
 from turbanet.ppo import DualEncoderActorCritic, PPOConfig, RolloutBuffer
 from turbanet.turba_train_state import TurbaTrainState
@@ -16,7 +18,7 @@ from turbanet.turba_train_state import TurbaTrainState
 SEED = 42
 SOLVE_THRESHOLD = 475
 TOTAL_TIMESTEPS = 5_000  # Per generation
-GENERATIONS = 100
+GENERATIONS = 200
 
 SWARM_SIZE = 1000
 
@@ -301,6 +303,18 @@ def genetic_update(train_state, rng, initial_parameters, episode_rewards) -> PPO
     return train_state, initial_parameters
 
 
+def calculate_similarity(params: dict) -> jnp.ndarray:
+    def cosine_similarity(x: jnp.ndarray) -> jnp.ndarray:
+        x_norm = x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
+        return x_norm @ x_norm.T
+
+    flat_tree = jax.tree_util.tree_map(lambda x: x.reshape(x.shape[0], -1), params)
+    similarity_tree = jax.tree_util.tree_map(cosine_similarity, flat_tree)
+    leaves = jax.tree_util.tree_leaves(similarity_tree)
+    overall_sim = jnp.nanmean(jnp.stack(leaves), axis=0)
+    return overall_sim[jnp.triu(jnp.ones((1000, 1000), dtype=bool), k=1)]
+
+
 # Run Jax PPO
 def run_jax_ppo(total_timesteps: int = 100_000) -> tuple[list, list]:
     # Initialize config
@@ -330,12 +344,22 @@ def run_jax_ppo(total_timesteps: int = 100_000) -> tuple[list, list]:
         seed=SEED,
     )
 
+    # Initialize plot directory
+    plot_dir = Path(f"test/integration/{datetime.now().strftime('%Y%m%d%H%M%S')}")
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    max_similarity_bin_height = 0.0
+    max_reward_bin_height = 0.0
+
     # Training loop
+    reward_history = []
+    similarity_history = []
     for generation in range(GENERATIONS):
         print(f"\n[JAX] training… Generation {generation + 1}/{GENERATIONS}")
 
         # Store initial parameters
         initial_parameters = copy(weights_to_int8(ts.params))
+        initial_similarity = calculate_similarity(initial_parameters)
+        similarity_history.append(initial_similarity)
 
         # Set loss function
         ts = ts.set_loss_fn(cfg.loss_fn)
@@ -367,17 +391,53 @@ def run_jax_ppo(total_timesteps: int = 100_000) -> tuple[list, list]:
 
             # Log progress
             if state.episode_rewards and update % 1 == 0:
+                final_similarity = calculate_similarity(state.train_state.params)
+
                 recent = [np.mean(r[-20:]) for r in state.episode_rewards]
                 print(
                     f"\t[JAX] progress {state.total_steps}/{cfg.total_timesteps} | "
                     f"mean_rew(last 20): {np.mean(recent):7.1f} | "
-                    f"loss: {loss.mean():7.1f}"
+                    f"loss: {loss.mean():7.1f} | "
+                    f"initial similarity: {initial_similarity.mean():.7f} | "
+                    f"final similarity: {final_similarity.mean():.7f}"
                 )
+
+        reward_history.append([np.mean(r) for r in state.episode_rewards])
 
         # Perform genetic optimization step
         ts, initial_parameters = genetic_update(
             state.train_state, state.rng, initial_parameters, state.episode_rewards
         )
+
+        fig, axes = plt.subplots(1, 2, figsize=(8, 4), layout="constrained")
+
+        # Set figure title
+        fig.suptitle(f"PPO Swarm Similarity/Performance (Total Generations: {generation + 1})")
+
+        def update(frame):
+            nonlocal max_similarity_bin_height, max_reward_bin_height
+            # Similarity Histogram
+            axes[0].cla()
+            data = axes[0].hist(similarity_history[frame], bins=200, range=(-1, 1))
+            if data[0].max() > max_similarity_bin_height:
+                max_similarity_bin_height = data[0].max()
+            axes[0].set_ylim(0, max_similarity_bin_height)
+            axes[0].set_title(f"Similarity | Generation {frame + 1}")
+
+            # Reward Histogram
+            axes[1].cla()
+            data = axes[1].hist(reward_history[frame], bins=200, range=(0, 500))
+            if data[0].max() > max_reward_bin_height:
+                max_reward_bin_height = data[0].max()
+            axes[1].set_xlim(0, 500)
+            axes[1].set_ylim(0, max_reward_bin_height)
+            axes[1].set_title(f"Mean Reward | Generation {frame + 1}")
+
+        ani = FuncAnimation(fig, update, frames=generation + 1)
+        ani.save(plot_dir / "ppo_swarm.gif", writer="pillow")
+
+        plt.close()
+        # plot(state, plot_dir, generation)
 
     # Close environments
     environments.close()
@@ -385,37 +445,5 @@ def run_jax_ppo(total_timesteps: int = 100_000) -> tuple[list, list]:
     return state, state.episode_rewards, state.timestep_log
 
 
-def plot(state: PPOState) -> None:
-    rewards = []
-    for t_data, r_data in zip(state.timestep_log, state.episode_rewards):
-        for t, r in zip(t_data, r_data):
-            rewards.append([t, r])
-    rewards = np.array(rewards, dtype=np.float32)
-
-    fig, axes = plt.subplots(nrows=3, figsize=(6, 8), layout="constrained")
-    # axes[0].scatter(x=rewards[:, 0], y=rewards[:, 1], marker=".", color="C0", alpha=0.1)
-
-    [axes[0].plot(r, color="C0", alpha=0.1) for r in state.episode_rewards]
-    axes[0].set_title("Line plot with alpha")
-
-    cmap = plt.colormaps["plasma"]
-    cmap = cmap.with_extremes(bad=cmap(0))
-    h, xedges, yedges = np.histogram2d(x=rewards[:, 0], y=rewards[:, 1], bins=[400, 100])
-    pcm = axes[1].pcolormesh(
-        xedges, yedges, h.T, cmap=cmap, norm="log", vmax=1.5e2, rasterized=True
-    )
-    fig.colorbar(pcm, ax=axes[1], label="# points", pad=0)
-    axes[1].set_title("2d histogram and log color scale")
-
-    pcm = axes[2].pcolormesh(xedges, yedges, h.T, cmap=cmap, vmax=1.5e2, rasterized=True)
-    fig.colorbar(pcm, ax=axes[2], label="# points", pad=0)
-    axes[2].set_title("2d histogram and linear color scale")
-
-    plt.savefig(f"test/integration/ppo_swarm_{datetime.now().strftime('%Y%m%d%H%M%S')}.png")
-    plt.show()
-    plt.close()
-
-
 if __name__ == "__main__":
     jax_results = run_jax_ppo(total_timesteps=TOTAL_TIMESTEPS)
-    plot(jax_results[0])
