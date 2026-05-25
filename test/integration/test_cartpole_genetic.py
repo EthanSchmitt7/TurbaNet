@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optax
 from matplotlib.animation import FuncAnimation
+from matplotlib.gridspec import GridSpec
 
 from turbanet.ppo import DualEncoderActorCritic, PPOConfig, RolloutBuffer
 from turbanet.turba_train_state import TurbaTrainState
@@ -18,9 +19,9 @@ from turbanet.turba_train_state import TurbaTrainState
 SEED = 42
 SOLVE_THRESHOLD = 475
 TOTAL_TIMESTEPS = 5_000  # Per generation
-GENERATIONS = 200
+GENERATIONS = 2000
 
-SWARM_SIZE = 1000
+SWARM_SIZE = 2500
 
 np.random.seed(SEED)
 
@@ -236,7 +237,7 @@ def genetic_update(train_state, rng, initial_parameters, episode_rewards) -> PPO
 
     # Selection (tournament selection)
     p = 0.5
-    k = 5
+    k = 200
     num_offspring = SWARM_SIZE
 
     if num_offspring == 0:
@@ -303,16 +304,37 @@ def genetic_update(train_state, rng, initial_parameters, episode_rewards) -> PPO
     return train_state, initial_parameters
 
 
-def calculate_similarity(params: dict) -> jnp.ndarray:
+def calculate_similarity(train_state: TurbaTrainState, x: jnp.ndarray = None) -> jnp.ndarray:
     def cosine_similarity(x: jnp.ndarray) -> jnp.ndarray:
         x_norm = x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
-        return x_norm @ x_norm.T
+        similarity = x_norm @ x_norm.T
+        return similarity[jnp.triu_indices(similarity.shape[0], k=1)]
 
-    flat_tree = jax.tree_util.tree_map(lambda x: x.reshape(x.shape[0], -1), params)
-    similarity_tree = jax.tree_util.tree_map(cosine_similarity, flat_tree)
-    leaves = jax.tree_util.tree_leaves(similarity_tree)
-    overall_sim = jnp.nanmean(jnp.stack(leaves), axis=0)
-    return overall_sim[jnp.triu(jnp.ones((1000, 1000), dtype=bool), k=1)]
+    params = train_state.params
+
+    parameter_tree = jax.tree_util.tree_map(lambda x: x.reshape(x.shape[0], -1), params)
+    parameter_similarity_tree = jax.tree_util.tree_map(cosine_similarity, parameter_tree)
+    layer_similarity = jnp.stack(jax.tree_util.tree_leaves(parameter_similarity_tree))
+    overall_similarity = jnp.nanmean(layer_similarity, axis=0)
+
+    if x is not None:
+        _, intermediates = train_state.predict(x, capture_intermediates=True)
+
+        flat_tree = jax.tree_util.tree_map(
+            lambda x: x.reshape(x.shape[0], -1), intermediates["intermediates"]
+        )
+
+        activation_tree = {k: v for k, v in flat_tree.items() if "__call__" not in k}
+        activation_similarity_tree = jax.tree_util.tree_map(cosine_similarity, activation_tree)
+        activation_similarity = jnp.stack(jax.tree_util.tree_leaves(activation_similarity_tree))
+
+        output_tree = {k: v for k, v in flat_tree.items() if "__call__" in k}
+        output_similarity_tree = jax.tree_util.tree_map(cosine_similarity, output_tree)
+        output_similarity = jnp.stack(jax.tree_util.tree_leaves(output_similarity_tree))
+
+        return overall_similarity, layer_similarity, activation_similarity, output_similarity
+
+    return overall_similarity
 
 
 # Run Jax PPO
@@ -347,7 +369,7 @@ def run_jax_ppo(total_timesteps: int = 100_000) -> tuple[list, list]:
     # Initialize plot directory
     plot_dir = Path(f"test/integration/{datetime.now().strftime('%Y%m%d%H%M%S')}")
     plot_dir.mkdir(parents=True, exist_ok=True)
-    max_similarity_bin_height = 0.0
+    max_similarity_bin_height = [0.0, 0.0, 0.0, 0.0]
     max_reward_bin_height = 0.0
 
     # Training loop
@@ -358,8 +380,6 @@ def run_jax_ppo(total_timesteps: int = 100_000) -> tuple[list, list]:
 
         # Store initial parameters
         initial_parameters = copy(weights_to_int8(ts.params))
-        initial_similarity = calculate_similarity(initial_parameters)
-        similarity_history.append(initial_similarity)
 
         # Set loss function
         ts = ts.set_loss_fn(cfg.loss_fn)
@@ -376,6 +396,9 @@ def run_jax_ppo(total_timesteps: int = 100_000) -> tuple[list, list]:
         # Get initial observations
         observation, _ = environments.reset()
 
+        # Calculate similarities
+        similarity_history.append(calculate_similarity(ts, observation))
+
         losses = []
         n_updates = cfg.total_timesteps // cfg.n_steps
         for update in range(1, n_updates + 1):
@@ -391,14 +414,14 @@ def run_jax_ppo(total_timesteps: int = 100_000) -> tuple[list, list]:
 
             # Log progress
             if state.episode_rewards and update % 1 == 0:
-                final_similarity = calculate_similarity(state.train_state.params)
+                final_similarity = calculate_similarity(state.train_state)
 
                 recent = [np.mean(r[-20:]) for r in state.episode_rewards]
                 print(
                     f"\t[JAX] progress {state.total_steps}/{cfg.total_timesteps} | "
                     f"mean_rew(last 20): {np.mean(recent):7.1f} | "
                     f"loss: {loss.mean():7.1f} | "
-                    f"initial similarity: {initial_similarity.mean():.7f} | "
+                    f"initial similarity: {similarity_history[-1][0].mean():.7f} | "
                     f"final similarity: {final_similarity.mean():.7f}"
                 )
 
@@ -409,35 +432,90 @@ def run_jax_ppo(total_timesteps: int = 100_000) -> tuple[list, list]:
             state.train_state, state.rng, initial_parameters, state.episode_rewards
         )
 
-        fig, axes = plt.subplots(1, 2, figsize=(8, 4), layout="constrained")
+        # Plot
+        rows, cols = 4, len(similarity_history[0][2])
+        fig = plt.figure(figsize=(16, 8), layout="constrained")
+        gs = GridSpec(rows, cols, figure=fig)
 
-        # Set figure title
-        fig.suptitle(f"PPO Swarm Similarity/Performance (Total Generations: {generation + 1})")
+        title = fig.suptitle("")
 
-        def update(frame):
+        # Rows 0 and 1: individual cells (4x6 grid)
+        axes = [[fig.add_subplot(gs[r, c]) for c in range(cols)] for r in range(2)]
+
+        # Rows 2 and 3: full-width
+        similarity_ax = fig.add_subplot(gs[2, :])
+        reward_ax = fig.add_subplot(gs[3, :])
+
+        def update(frame: int) -> None:
             nonlocal max_similarity_bin_height, max_reward_bin_height
-            # Similarity Histogram
-            axes[0].cla()
-            data = axes[0].hist(similarity_history[frame], bins=200, range=(-1, 1))
-            if data[0].max() > max_similarity_bin_height:
-                max_similarity_bin_height = data[0].max()
-            axes[0].set_ylim(0, max_similarity_bin_height)
-            axes[0].set_title(f"Similarity | Generation {frame + 1}")
+
+            # Set figure title
+            title.set_text(
+                f"PPO Swarm Similarity/Performance | Generation: {frame + 1} / {generation + 1}"
+            )
+
+            param_names = state.train_state.params.keys()
+
+            # Layer similarity
+            for idx, (ax, name) in enumerate(zip(axes[0], param_names)):
+                ax.cla()
+
+                ax.set_title(name + " Parameter")
+
+                bias_index = idx * 2
+                kernel_index = idx * 2 + 1
+
+                # Plot histogram
+                bias_data = ax.hist(
+                    similarity_history[frame][1][bias_index],
+                    bins=100,
+                    range=(-1, 1),
+                    alpha=0.5,
+                    color="b",
+                )
+                kernel_data = ax.hist(
+                    similarity_history[frame][1][kernel_index],
+                    bins=100,
+                    range=(-1, 1),
+                    alpha=0.5,
+                    color="r",
+                )
+                ax.legend(["Bias", "Kernel"])
+
+                # Update max bin height
+                if max(bias_data[0].max(), kernel_data[0].max()) > max_similarity_bin_height[1]:
+                    max_similarity_bin_height[1] = max(bias_data[0].max(), kernel_data[0].max())
+
+            # Activation similarity
+            for idx, (ax, name) in enumerate(zip(axes[1], param_names)):
+                ax.cla()
+
+                ax.set_title(name + " Activation")
+
+                data = ax.hist(similarity_history[frame][2][idx], bins=100, range=(-1, 1))
+                if data[0].max() > max_similarity_bin_height[2]:
+                    max_similarity_bin_height[2] = data[0].max()
+
+            # Overall similarity
+            similarity_ax.cla()
+            similarity_ax.set_title("Overall similarity")
+            data = similarity_ax.hist(similarity_history[frame][0], bins=200, range=(-1, 1))
+            if data[0].max() > max_similarity_bin_height[0]:
+                max_similarity_bin_height[0] = data[0].max()
 
             # Reward Histogram
-            axes[1].cla()
-            data = axes[1].hist(reward_history[frame], bins=200, range=(0, 500))
+            reward_ax.cla()
+            reward_ax.set_title("Mean Reward")
+            data = reward_ax.hist(reward_history[frame], bins=200, range=(0, 500))
             if data[0].max() > max_reward_bin_height:
                 max_reward_bin_height = data[0].max()
-            axes[1].set_xlim(0, 500)
-            axes[1].set_ylim(0, max_reward_bin_height)
-            axes[1].set_title(f"Mean Reward | Generation {frame + 1}")
+            reward_ax.set_xlim(0, 500)
+            reward_ax.set_ylim(0, max_reward_bin_height)
 
         ani = FuncAnimation(fig, update, frames=generation + 1)
+        ani.save(plot_dir / "ppo_swarm_tmp.gif", writer="pillow")
         ani.save(plot_dir / "ppo_swarm.gif", writer="pillow")
-
         plt.close()
-        # plot(state, plot_dir, generation)
 
     # Close environments
     environments.close()
