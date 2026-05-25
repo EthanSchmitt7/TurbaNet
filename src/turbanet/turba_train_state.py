@@ -77,7 +77,9 @@ def make_train_step(loss_fn: Callable) -> Callable:
     return jax.jit(jax.vmap(train_fn))
 
 
-def predict_fn(state: TurbaTrainState, input: ArrayImpl) -> ArrayImpl:
+def predict_fn(
+    state: TurbaTrainState, input: ArrayImpl, capture_intermediates: bool = False
+) -> ArrayImpl:
     """Predict on a batch of data.
 
     Args:
@@ -87,10 +89,12 @@ def predict_fn(state: TurbaTrainState, input: ArrayImpl) -> ArrayImpl:
     Returns:
         ArrayImpl: The prediction of the model.
     """
-    return state.apply_fn({"params": state.params}, input)
+    return state.apply_fn(
+        {"params": state.params}, input, capture_intermediates=capture_intermediates
+    )
 
 
-predict = jax.jit(jax.vmap(predict_fn, in_axes=(0, 0)))
+predict = jax.jit(jax.vmap(predict_fn, in_axes=(0, 0, None)), static_argnums=(2,))
 
 
 def evaluate_fn(
@@ -177,7 +181,7 @@ class TurbaTrainState(TrainState):
         # Create train step
         return self.replace(train_function=make_train_step(loss_fn))
 
-    def predict(self, input_data: np.ndarray) -> ArrayImpl:
+    def predict(self, input_data: np.ndarray, capture_intermediates: bool = False) -> ArrayImpl:
         """Predicts on a batch of data.
 
         Args:
@@ -199,7 +203,7 @@ class TurbaTrainState(TrainState):
         if isinstance(input_data, jnp.ndarray):
             input_data = jnp.asarray(input_data)
 
-        return predict(self, input_data)
+        return predict(self, input_data, capture_intermediates)
 
     def evaluate(
         self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable
