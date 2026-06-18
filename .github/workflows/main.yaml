@@ -1,16 +1,15 @@
-name: Tests
+name: main (3.12-3.14)
 
 on:
-  pull_request:
   push:
-    branches: [main, develop]
+    branches: [main]
 
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ${{ fromJson(github.event_name == 'pull_request' && '["3.14"]' || '["3.12","3.13","3.14"]') }}
+        python-version: ["3.12","3.13","3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
