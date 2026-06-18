@@ -1,3 +1,6 @@
+[![.github/workflows/main.yaml](https://github.com/EthanSchmitt7/TurbaNet/actions/workflows/main.yaml/badge.svg?branch=main&event=push)](https://github.com/EthanSchmitt7/TurbaNet/actions/workflows/main.yaml)
+[![.github/workflows/develop.yaml](https://github.com/EthanSchmitt7/TurbaNet/actions/workflows/develop.yaml/badge.svg?branch=develop&event=push)](https://github.com/EthanSchmitt7/TurbaNet/actions/workflows/develop.yaml)
+
 # TurbaNet
 
 TurbaNet is a lightweight and user-friendly API wrapper for the JAX library, designed to simplify and accelerate the setup of swarm-based training, evaluation, and simulation of small neural networks.​ Based on the work presented by Will Whitney in his blog post from 2021.[^1]
