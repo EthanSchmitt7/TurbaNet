@@ -1,5 +1,5 @@
-[![.github/workflows/main.yaml](https://github.com/EthanSchmitt7/TurbaNet/actions/workflows/main.yaml/badge.svg?branch=main&event=push)](https://github.com/EthanSchmitt7/TurbaNet/actions/workflows/main.yaml)
-[![.github/workflows/develop.yaml](https://github.com/EthanSchmitt7/TurbaNet/actions/workflows/develop.yaml/badge.svg?branch=develop&event=push)](https://github.com/EthanSchmitt7/TurbaNet/actions/workflows/develop.yaml)
+[![main (3.12-3.14)](https://github.com/EthanSchmitt7/TurbaNet/actions/workflows/main.yaml/badge.svg)](https://github.com/EthanSchmitt7/TurbaNet/actions/workflows/main.yaml)
+[![develop (3.12-3.14)](https://github.com/EthanSchmitt7/TurbaNet/actions/workflows/develop.yaml/badge.svg)](https://github.com/EthanSchmitt7/TurbaNet/actions/workflows/develop.yaml)
 
 # TurbaNet
 
