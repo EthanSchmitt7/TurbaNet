@@ -2,6 +2,7 @@
 scratchpad*
 data*
 .vscode*
+scratchpad*
 test/tensorboard/*
 *.gif
 
