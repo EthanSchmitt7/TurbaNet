@@ -1,4 +1,4 @@
-name: Tests
+name: PR Tests
 
 on:
   pull_request:
@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ${{ fromJson(github.event_name == 'pull_request' && '["3.14"]' || '["3.12","3.13","3.14"]') }}
+        python-version: ${{ fromJson(github.base_ref == 'main' && '["3.12","3.13","3.14"]' || '["3.14"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
