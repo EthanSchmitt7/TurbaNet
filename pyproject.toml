@@ -12,13 +12,14 @@ description = "A package designed for fast training and inference for large numb
 readme = "README.md"
 requires-python = ">=3.12"
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
 ]
-dependencies = [
-  "flax >= 0.10.4",
-]
+dependencies = ["flax >= 0.10.4"]
+
+[project.optional-dependencies]
+tboard = ["torch", "tensorboard"]
 
 [project.urls]
 Homepage = "https://github.com/EthanSchmitt7/TurbaNet"

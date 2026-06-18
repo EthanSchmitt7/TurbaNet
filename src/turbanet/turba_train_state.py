@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
+import flax
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -14,74 +14,70 @@ from flax.training.train_state import TrainState
 if TYPE_CHECKING:
     from typing import Callable
 
-    from jaxlib.xla_extension import ArrayImpl
-
 
 __all__ = ["TurbaTrainState"]
 
 
+def make_params_fn(model: nn.Module, sample_input: jax.Array, seed: int) -> dict:
+    params = model.init(jr.PRNGKey(seed), sample_input)["params"]
+    return params
+
+
+make_params = jax.vmap(make_params_fn, in_axes=(None, None, 0))
+
+
 def create_fn(
-    model: nn.Module,
-    optimizer: optax.GradientTransformation,
-    sample_input: ArrayImpl,
-    seed: int,
+    apply_fn: Callable, optimizer: optax.GradientTransformation, params: dict
 ) -> TurbaTrainState:
     """Creates an initial `TurbaTrainState`.
 
     Args:
-        model: The model to train.
+        apply_fn: The apply function of the model.
         optimizer: The optimizer to use.
-        input_size: The size of the input.
-        seed: The seed to use for initialization.
+        params: The parameters of the model.
 
     Returns:
         TurbaTrainState: A `TurbaTrainState` object.
     """
 
     # initialize parameters by passing an input template
-    params = model.init(jr.PRNGKey(seed), sample_input)["params"]
-    return TurbaTrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
+    return TurbaTrainState.create(apply_fn=apply_fn, params=params, tx=optimizer)
 
 
-create = jax.vmap(create_fn, in_axes=(None, None, None, 0))
+_create = jax.vmap(create_fn, in_axes=(None, None, 0))
 
 
-@partial(jax.jit, static_argnames=("loss_fn",))
-def train_fn(
-    state: TurbaTrainState,
-    input: ArrayImpl,
-    output: ArrayImpl,
-    loss_fn: Callable[[dict, dict, Callable], tuple[ArrayImpl, ArrayImpl]],
-) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
-    """Train for a single step.
+def make_train_step(loss_fn: Callable) -> Callable:
+    def train_fn(
+        state: TurbaTrainState, input: jax.Array, output: jax.Array
+    ) -> tuple[TurbaTrainState, jax.Array, jax.Array]:
+        """Train for a single step.
 
-    Args:
-        state: The current `TurbaTrainState` object.
-        input: The input to the model.
-        output: The output of the model.
-        loss_fn: The loss function to use.
+        Args:
+            state: The current `TurbaTrainState` object.
+            input: The input to the model.
+            output: The output of the model.
+            loss_fn: The loss function to use.
 
-    Returns:
-        tuple[TurbaTrainState, ArrayImpl, ArrayImpl]: The updated
-            (state, loss, prediction).
-    """
+        Returns:
+            tuple[TurbaTrainState, jax.Array, jax.Array]: The updated
+                (state, loss, prediction).
+        """
 
-    def wrapped_loss_fn(
-        params: dict, input: ArrayImpl, output: ArrayImpl
-    ) -> tuple[ArrayImpl, ArrayImpl]:
-        return loss_fn(params, input, output, state.apply_fn)
+        def wrapped_loss_fn(params: dict) -> tuple[jax.Array, jax.Array]:
+            return loss_fn(params, input, output, state.apply_fn)
 
-    grad_fn = jax.value_and_grad(wrapped_loss_fn, has_aux=True)
-    (loss, prediction), grads = grad_fn(state.params, input, output)
-    state = state.apply_gradients(grads=grads)
-    return state, loss, prediction
+        grad_fn = jax.value_and_grad(wrapped_loss_fn, has_aux=True)
+        (loss, aux), grads = grad_fn(state.params)
+        new_state = state.apply_gradients(grads=grads)
+        return new_state, loss, aux
+
+    return jax.jit(jax.vmap(train_fn))
 
 
-train = jax.vmap(train_fn, in_axes=(0, 0, 0, None))
-
-
-@jax.jit
-def predict_fn(state: TurbaTrainState, input: ArrayImpl) -> ArrayImpl:
+def predict_fn(
+    state: TurbaTrainState, input: jax.Array, capture_intermediates: bool = False
+) -> jax.Array:
     """Predict on a batch of data.
 
     Args:
@@ -89,21 +85,19 @@ def predict_fn(state: TurbaTrainState, input: ArrayImpl) -> ArrayImpl:
         input: The input to the model.
 
     Returns:
-        ArrayImpl: The prediction of the model.
+        jax.Array: The prediction of the model.
     """
-    return state.apply_fn({"params": state.params}, input)
+    return state.apply_fn(
+        {"params": state.params}, input, capture_intermediates=capture_intermediates
+    )
 
 
-predict = jax.vmap(predict_fn, in_axes=(0, 0))
+predict = jax.jit(jax.vmap(predict_fn, in_axes=(0, 0, None)), static_argnums=(2,))
 
 
-@partial(jax.jit, static_argnames=("loss_fn",))
 def evaluate_fn(
-    state: TurbaTrainState,
-    input: ArrayImpl,
-    output: ArrayImpl,
-    loss_fn: Callable[[dict, dict, Callable], tuple[ArrayImpl, ArrayImpl]],
-) -> ArrayImpl:
+    state: TurbaTrainState, input: jax.Array, output: jax.Array, loss_fn: Callable
+) -> jax.Array:
     """Evaluate a loss function.
 
     Args:
@@ -113,23 +107,32 @@ def evaluate_fn(
         loss_fn: The loss function to use.
 
     Returns:
-        ArrayImpl: The loss of the model."""
+        jax.Array: The loss of the model."""
     return loss_fn(state.params, input, output, state.apply_fn)
 
 
-evaluate = jax.vmap(evaluate_fn, in_axes=(0, 0, 0, None))
+evaluate = jax.jit(jax.vmap(evaluate_fn, in_axes=(0, 0, 0, None)), static_argnames=("loss_fn",))
 
 
 class TurbaTrainState(TrainState):
     """TrainState for TurbaNet."""
+
+    train_function: Callable = flax.struct.field(pytree_node=False, default=None)
+
+    @classmethod
+    def vmap_create(
+        cls, *, apply_fn: Callable, params: dict, tx: optax.GradientTransformation, **kwargs
+    ) -> TurbaTrainState:
+        return _create(apply_fn, tx, params)
 
     @staticmethod
     def swarm(
         model: nn.Module,
         optimizer: optax.GradientTransformation,
         swarm_size: int,
-        sample_input: ArrayImpl,
-        seed: ArrayImpl = None,
+        input_size: int = None,
+        sample_input: jax.Array = None,
+        seed: jax.Array = None,
     ) -> TurbaTrainState:
         """Creates a swarm of initial `TurbaTrainState`s.
 
@@ -138,11 +141,20 @@ class TurbaTrainState(TrainState):
             optimizer: The optimizer to use.
             swarm_size: The size of the swarm.
             input_size: The size of the input.
+            sample_input: A example of an input to the network
             seed: The seed to use for initialization.
 
         Returns:
             TurbaTrainState: A `TurbaTrainState` object.
         """
+        if input_size is None and sample_input is None:
+            raise RuntimeError(
+                "'input_size' or a 'sample_input' must be provided to TurbaTrainState.swarm."
+            )
+
+        if input_size is not None:
+            sample_input = jnp.zeros((1, input_size))
+
         if seed is None:
             seed = 0
 
@@ -152,9 +164,22 @@ class TurbaTrainState(TrainState):
         if len(seed) != swarm_size:
             raise ValueError("Seed and learning rate must be the same length as swarm_size.")
 
-        return create(model, optimizer, sample_input, seed)
+        params = make_params(model, sample_input, seed)
+        return _create(model.apply, optimizer, params)
 
-    def predict(self, input_data: np.ndarray) -> ArrayImpl:
+    def set_loss_fn(self, loss_fn: Callable) -> TurbaTrainState:
+        """Sets the loss function to use.
+
+        Args:
+            loss_fn: The loss function to use.
+
+        Returns:
+            TurbaTrainState: The updated `TurbaTrainState` object.
+        """
+        # Create train step
+        return self.replace(train_function=make_train_step(loss_fn))
+
+    def predict(self, input_data: np.ndarray, capture_intermediates: bool = False) -> jax.Array:
         """Predicts on a batch of data.
 
         Args:
@@ -162,7 +187,7 @@ class TurbaTrainState(TrainState):
                 (swarm_size, batch_size, input_size)
 
         Returns:
-            ArrayImpl: A batch of predictions
+            jax.Array: A batch of predictions
         """
         if len(self) == 1 and input_data.shape[0] != 1:
             input_data = input_data.reshape(1, *input_data.shape)
@@ -176,11 +201,11 @@ class TurbaTrainState(TrainState):
         if isinstance(input_data, jnp.ndarray):
             input_data = jnp.asarray(input_data)
 
-        return predict(self, input_data)
+        return predict(self, input_data, capture_intermediates)
 
     def evaluate(
         self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable
-    ) -> tuple[ArrayImpl, ArrayImpl]:
+    ) -> tuple[jax.Array, jax.Array]:
         """Evaluates a loss function on a batch of data.
 
         Args:
@@ -191,7 +216,7 @@ class TurbaTrainState(TrainState):
             loss_fn: The loss function to use.
 
         Returns:
-            tuple[ArrayImpl, ArrayImpl]: A batch of (loss, prediction)
+            tuple[jax.Array, jax.Array]: A batch of (loss, prediction)
         """
         if len(self) == 1 and input_data.shape[0] != 1:
             input_data = input_data.reshape(1, *input_data.shape)
@@ -220,8 +245,8 @@ class TurbaTrainState(TrainState):
         return evaluate(self, input_data, output_data, loss_fn)
 
     def train(
-        self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable
-    ) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
+        self, input_data: np.ndarray, output_data: np.ndarray, **kwargs: dict
+    ) -> tuple[TurbaTrainState, jax.Array, jax.Array]:
         """Trains on a batch of data.
 
         Args:
@@ -231,7 +256,7 @@ class TurbaTrainState(TrainState):
                 (swarm_size, batch_size, output_size)
 
         Returns:
-            tuple[TurbaTrainState, ArrayImpl, ArrayImpl]: The updated
+            tuple[TurbaTrainState, jax.Array, jax.Array]: The updated
                 (TrainState, loss, prediction)
         """
         if len(self) == 1 and input_data.shape[0] != 1:
@@ -258,7 +283,14 @@ class TurbaTrainState(TrainState):
         if not isinstance(output_data, jnp.ndarray):
             output_data = jnp.asarray(output_data)
 
-        return train(self, input_data, output_data, loss_fn)
+        return self.train_function(self, input_data, output_data)
+
+    def cost_analysis(self, input: jax.Array) -> dict:
+        return (
+            jax.jit(self.apply_fn)
+            .lower({"params": self.get_state(0).params}, input)
+            .cost_analysis()
+        )
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -268,157 +300,22 @@ class TurbaTrainState(TrainState):
         return tuple(list(first_kernel[0:2]) + [last_kernel[-1]])
 
     def __len__(self) -> int:
-        return len(self.opt_state[0].count)
+        return list(self.params.values())[0]["kernel"].shape[0]
 
     @jax.jit
-    def __add__(self: TurbaTrainState, other: TurbaTrainState) -> TurbaTrainState:
-        if len(self) != len(other):
-            raise ValueError(
-                f"Cannot add TrainStates with incompatible lengths {len(self)}, {len(other)}."
-            )
-        mu = {}
-        nu = {}
-        params = {}
-        for key in self.params.keys():
-            params[key] = {}
-            p1 = self.params[key]["bias"]
-            p2 = other.params[key]["bias"]
-            if p1.shape != p2.shape:
-                raise ValueError(
-                    f"Cannot append TrainStates with incompatible "
-                    f"bias dimensions {p1.shape}, {p2.shape}."
-                )
-            params[key]["bias"] = p1 + p2
+    def append(self, state2: TurbaTrainState) -> TurbaTrainState:
+        leaves_a, treedef = jax.tree_util.tree_flatten(self)
+        leaves_b, _ = jax.tree_util.tree_flatten(state2)
 
-            p1 = self.params[key]["kernel"]
-            p2 = other.params[key]["kernel"]
-            if p1.shape != p2.shape:
-                raise ValueError(
-                    f"Cannot append TrainStates with incompatible "
-                    f"kernel dimensions {p1.shape}, {p2.shape}."
-                )
-            params[key]["kernel"] = p1 + p2
+        merged_leaves = [jnp.concatenate([a, b], axis=0) for a, b in zip(leaves_a, leaves_b)]
 
-            mu[key] = {}
-            p1 = self.opt_state[0].mu[key]["bias"]
-            p2 = other.opt_state[0].mu[key]["bias"]
-            mu[key]["bias"] = p1 + p2
+        return treedef.unflatten(merged_leaves)
 
-            p1 = self.opt_state[0].mu[key]["kernel"]
-            p2 = other.opt_state[0].mu[key]["kernel"]
-            mu[key]["kernel"] = p1 + p2
-
-            nu[key] = {}
-            p1 = self.opt_state[0].nu[key]["bias"]
-            p2 = other.opt_state[0].nu[key]["bias"]
-            nu[key]["bias"] = p1 + p2
-
-            p1 = self.opt_state[0].nu[key]["kernel"]
-            p2 = other.opt_state[0].nu[key]["kernel"]
-            nu[key]["kernel"] = p1 + p2
-
-        return TurbaTrainState(
-            step=self.step,
-            apply_fn=self.apply_fn,
-            params=params,
-            tx=self.tx,
-            opt_state=(
-                optax.ScaleByAdamState(count=self.opt_state[0].count, mu=mu, nu=nu),
-                optax.EmptyState(),
-            ),
-        )
-
-    @jax.jit
-    def append(self, other: TurbaTrainState) -> TurbaTrainState:
-        mu = {}
-        nu = {}
-        params = {}
-        for key in self.params.keys():
-            params[key] = {}
-            p1 = self.params[key]["bias"]
-            p2 = other.params[key]["bias"]
-            if p1.shape != p2.shape:
-                raise ValueError(
-                    f"Cannot append TrainStates with incompatible "
-                    f"bias dimensions {p1.shape}, {p2.shape}."
-                )
-            params[key]["bias"] = jnp.append(p1, p2, axis=0)
-
-            p1 = self.params[key]["kernel"]
-            p2 = other.params[key]["kernel"]
-            if p1.shape != p2.shape:
-                raise ValueError(
-                    f"Cannot append TrainStates with incompatible "
-                    f"kernel dimensions {p1.shape}, {p2.shape}."
-                )
-            params[key]["kernel"] = jnp.append(p1, p2, axis=0)
-
-            mu[key] = {}
-            p1 = self.opt_state[0].mu[key]["bias"]
-            p2 = other.opt_state[0].mu[key]["bias"]
-            mu[key]["bias"] = jnp.append(p1, p2, axis=0)
-
-            p1 = self.opt_state[0].mu[key]["kernel"]
-            p2 = other.opt_state[0].mu[key]["kernel"]
-            mu[key]["kernel"] = jnp.append(p1, p2, axis=0)
-
-            nu[key] = {}
-            p1 = self.opt_state[0].nu[key]["bias"]
-            p2 = other.opt_state[0].nu[key]["bias"]
-            nu[key]["bias"] = jnp.append(p1, p2, axis=0)
-
-            p1 = self.opt_state[0].nu[key]["kernel"]
-            p2 = other.opt_state[0].nu[key]["kernel"]
-            nu[key]["kernel"] = jnp.append(p1, p2, axis=0)
-
-        step = jnp.append(self.step, other.step)
-        count = jnp.append(self.opt_state[0].count, other.opt_state[0].count)
-
-        return TurbaTrainState(
-            step=step,
-            apply_fn=self.apply_fn,
-            params=params,
-            tx=self.tx,
-            opt_state=(
-                optax.ScaleByAdamState(count=count, mu=mu, nu=nu),
-                optax.EmptyState(),
-            ),
-        )
-
-    @jax.jit
     def merge(self) -> TurbaTrainState:
-        mu = {}
-        nu = {}
-        params = {}
-        for key in self.params.keys():
-            params[key] = {}
-            params[key]["bias"] = jnp.mean(self.params[key]["bias"], axis=0).reshape(1, -1)
-            params[key]["kernel"] = jnp.expand_dims(
-                jnp.mean(self.params[key]["kernel"], axis=0), 0
-            )
+        return jax.tree_util.tree_map(lambda x: jnp.expand_dims(jnp.mean(x, axis=0), 0), self)
 
-            mu[key] = {}
-            mu[key]["bias"] = jnp.mean(self.opt_state[0].mu[key]["bias"], axis=0).reshape(1, -1)
-            mu[key]["kernel"] = jnp.expand_dims(
-                jnp.mean(self.opt_state[0].mu[key]["kernel"], axis=0), 0
-            )
+    def get_state(self, index: int) -> TurbaTrainState:
+        return jax.tree_util.tree_map(lambda x: x[index], self)
 
-            nu[key] = {}
-            nu[key]["bias"] = jnp.mean(self.opt_state[0].nu[key]["bias"], axis=0).reshape(1, -1)
-            nu[key]["kernel"] = jnp.expand_dims(
-                jnp.mean(self.opt_state[0].nu[key]["kernel"], axis=0), 0
-            )
-
-        step = jnp.array([self.step.max()])
-        count = jnp.array([self.opt_state[0].count.max()], dtype="int32")
-
-        return TurbaTrainState(
-            step=step,
-            apply_fn=self.apply_fn,
-            params=params,
-            tx=self.tx,
-            opt_state=(
-                optax.ScaleByAdamState(count=count, mu=mu, nu=nu),
-                optax.EmptyState(),
-            ),
-        )
+    def remove_state(self, index: int) -> TurbaTrainState:
+        return jax.tree_util.tree_map(lambda x: jnp.delete(x, index, axis=0), self)

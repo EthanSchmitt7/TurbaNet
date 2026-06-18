@@ -9,7 +9,7 @@ import optax
 if TYPE_CHECKING:
     from jaxlib.xla_extension import ArrayImpl
 
-__all__ = ["l2_loss", "mse", "softmax_cross_entropy"]
+__all__ = ["l2_loss", "mse", "softmax_cross_entropy", "cross_entropy"]
 
 
 def l2_loss(
@@ -40,4 +40,10 @@ def cross_entropy(
 def softmax_cross_entropy(params: dict, input: ArrayImpl, output: ArrayImpl, apply_fn: Callable):  # noqa ANN201
     logits = apply_fn({"params": params}, input)
     loss = optax.softmax_cross_entropy(logits, output).mean()
+    return loss, logits
+
+
+def cross_entropy(params: dict, input: ArrayImpl, output: ArrayImpl, apply_fn: Callable):  # noqa ANN201
+    logits = apply_fn({"params": params}, input)
+    loss = -jnp.sum(output * jnp.log(logits), axis=-1).mean()
     return loss, logits
