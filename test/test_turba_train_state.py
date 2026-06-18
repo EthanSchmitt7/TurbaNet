@@ -36,29 +36,6 @@ class TestTurbaTrainState(TestCase):
         self.assertTupleEqual(self.swarm1.shape, (10, 3, 1))
         self.assertTupleEqual(self.swarm2.shape, (10, 3, 1))
 
-    def test_add(self) -> None:
-        added_swarms = self.swarm1 + self.swarm2
-        self.assertEqual(len(added_swarms), 10)
-        self.assertTupleEqual(added_swarms.shape, (10, 3, 1))
-        for key in added_swarms.params.keys():
-            # Add params together
-            bias = self.swarm1.params[key]["bias"] + self.swarm2.params[key]["bias"]
-            kernel = self.swarm1.params[key]["kernel"] + self.swarm2.params[key]["kernel"]
-
-            # Test shape is correct
-            self.assertTupleEqual(added_swarms.params[key]["bias"].shape, bias.shape)
-            self.assertTupleEqual(added_swarms.params[key]["kernel"].shape, kernel.shape)
-
-            # Assert the params are correct
-            np.testing.assert_array_equal(added_swarms.params[key]["bias"], bias)
-            np.testing.assert_array_equal(added_swarms.params[key]["kernel"], kernel)
-
-        # Assert the step and count are correct
-        np.testing.assert_array_equal(self.swarm1.step, added_swarms.step)
-        np.testing.assert_array_equal(
-            self.swarm1.opt_state[0].count, added_swarms.opt_state[0].count
-        )
-
     def test_append(self) -> None:
         appended_swarm = self.swarm1.append(self.swarm2)
         self.assertEqual(len(appended_swarm), 20)

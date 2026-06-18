@@ -14,13 +14,11 @@ from flax.training.train_state import TrainState
 if TYPE_CHECKING:
     from typing import Callable
 
-    from jaxlib.xla_extension import ArrayImpl
-
 
 __all__ = ["TurbaTrainState"]
 
 
-def make_params_fn(model: nn.Module, sample_input: ArrayImpl, seed: int) -> dict:
+def make_params_fn(model: nn.Module, sample_input: jax.Array, seed: int) -> dict:
     params = model.init(jr.PRNGKey(seed), sample_input)["params"]
     return params
 
@@ -51,8 +49,8 @@ _create = jax.vmap(create_fn, in_axes=(None, None, 0))
 
 def make_train_step(loss_fn: Callable) -> Callable:
     def train_fn(
-        state: TurbaTrainState, input: ArrayImpl, output: ArrayImpl
-    ) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
+        state: TurbaTrainState, input: jax.Array, output: jax.Array
+    ) -> tuple[TurbaTrainState, jax.Array, jax.Array]:
         """Train for a single step.
 
         Args:
@@ -62,11 +60,11 @@ def make_train_step(loss_fn: Callable) -> Callable:
             loss_fn: The loss function to use.
 
         Returns:
-            tuple[TurbaTrainState, ArrayImpl, ArrayImpl]: The updated
+            tuple[TurbaTrainState, jax.Array, jax.Array]: The updated
                 (state, loss, prediction).
         """
 
-        def wrapped_loss_fn(params: dict) -> tuple[ArrayImpl, ArrayImpl]:
+        def wrapped_loss_fn(params: dict) -> tuple[jax.Array, jax.Array]:
             return loss_fn(params, input, output, state.apply_fn)
 
         grad_fn = jax.value_and_grad(wrapped_loss_fn, has_aux=True)
@@ -78,8 +76,8 @@ def make_train_step(loss_fn: Callable) -> Callable:
 
 
 def predict_fn(
-    state: TurbaTrainState, input: ArrayImpl, capture_intermediates: bool = False
-) -> ArrayImpl:
+    state: TurbaTrainState, input: jax.Array, capture_intermediates: bool = False
+) -> jax.Array:
     """Predict on a batch of data.
 
     Args:
@@ -87,7 +85,7 @@ def predict_fn(
         input: The input to the model.
 
     Returns:
-        ArrayImpl: The prediction of the model.
+        jax.Array: The prediction of the model.
     """
     return state.apply_fn(
         {"params": state.params}, input, capture_intermediates=capture_intermediates
@@ -98,8 +96,8 @@ predict = jax.jit(jax.vmap(predict_fn, in_axes=(0, 0, None)), static_argnums=(2,
 
 
 def evaluate_fn(
-    state: TurbaTrainState, input: ArrayImpl, output: ArrayImpl, loss_fn: Callable
-) -> ArrayImpl:
+    state: TurbaTrainState, input: jax.Array, output: jax.Array, loss_fn: Callable
+) -> jax.Array:
     """Evaluate a loss function.
 
     Args:
@@ -109,7 +107,7 @@ def evaluate_fn(
         loss_fn: The loss function to use.
 
     Returns:
-        ArrayImpl: The loss of the model."""
+        jax.Array: The loss of the model."""
     return loss_fn(state.params, input, output, state.apply_fn)
 
 
@@ -133,8 +131,8 @@ class TurbaTrainState(TrainState):
         optimizer: optax.GradientTransformation,
         swarm_size: int,
         input_size: int = None,
-        sample_input: ArrayImpl = None,
-        seed: ArrayImpl = None,
+        sample_input: jax.Array = None,
+        seed: jax.Array = None,
     ) -> TurbaTrainState:
         """Creates a swarm of initial `TurbaTrainState`s.
 
@@ -181,7 +179,7 @@ class TurbaTrainState(TrainState):
         # Create train step
         return self.replace(train_function=make_train_step(loss_fn))
 
-    def predict(self, input_data: np.ndarray, capture_intermediates: bool = False) -> ArrayImpl:
+    def predict(self, input_data: np.ndarray, capture_intermediates: bool = False) -> jax.Array:
         """Predicts on a batch of data.
 
         Args:
@@ -189,7 +187,7 @@ class TurbaTrainState(TrainState):
                 (swarm_size, batch_size, input_size)
 
         Returns:
-            ArrayImpl: A batch of predictions
+            jax.Array: A batch of predictions
         """
         if len(self) == 1 and input_data.shape[0] != 1:
             input_data = input_data.reshape(1, *input_data.shape)
@@ -207,7 +205,7 @@ class TurbaTrainState(TrainState):
 
     def evaluate(
         self, input_data: np.ndarray, output_data: np.ndarray, loss_fn: Callable
-    ) -> tuple[ArrayImpl, ArrayImpl]:
+    ) -> tuple[jax.Array, jax.Array]:
         """Evaluates a loss function on a batch of data.
 
         Args:
@@ -218,7 +216,7 @@ class TurbaTrainState(TrainState):
             loss_fn: The loss function to use.
 
         Returns:
-            tuple[ArrayImpl, ArrayImpl]: A batch of (loss, prediction)
+            tuple[jax.Array, jax.Array]: A batch of (loss, prediction)
         """
         if len(self) == 1 and input_data.shape[0] != 1:
             input_data = input_data.reshape(1, *input_data.shape)
@@ -248,7 +246,7 @@ class TurbaTrainState(TrainState):
 
     def train(
         self, input_data: np.ndarray, output_data: np.ndarray, **kwargs: dict
-    ) -> tuple[TurbaTrainState, ArrayImpl, ArrayImpl]:
+    ) -> tuple[TurbaTrainState, jax.Array, jax.Array]:
         """Trains on a batch of data.
 
         Args:
@@ -258,7 +256,7 @@ class TurbaTrainState(TrainState):
                 (swarm_size, batch_size, output_size)
 
         Returns:
-            tuple[TurbaTrainState, ArrayImpl, ArrayImpl]: The updated
+            tuple[TurbaTrainState, jax.Array, jax.Array]: The updated
                 (TrainState, loss, prediction)
         """
         if len(self) == 1 and input_data.shape[0] != 1:
@@ -287,7 +285,7 @@ class TurbaTrainState(TrainState):
 
         return self.train_function(self, input_data, output_data)
 
-    def cost_analysis(self, input: ArrayImpl) -> dict:
+    def cost_analysis(self, input: jax.Array) -> dict:
         return (
             jax.jit(self.apply_fn)
             .lower({"params": self.get_state(0).params}, input)
@@ -312,6 +310,9 @@ class TurbaTrainState(TrainState):
         merged_leaves = [jnp.concatenate([a, b], axis=0) for a, b in zip(leaves_a, leaves_b)]
 
         return treedef.unflatten(merged_leaves)
+
+    def merge(self) -> TurbaTrainState:
+        return jax.tree_util.tree_map(lambda x: jnp.expand_dims(jnp.mean(x, axis=0), 0), self)
 
     def get_state(self, index: int) -> TurbaTrainState:
         return jax.tree_util.tree_map(lambda x: x[index], self)
