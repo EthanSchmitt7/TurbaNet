@@ -5,7 +5,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-__all__ = ["PPOConfig", "RolloutBuffer", "ActorCritic", "DualEncoderActorCritic"]
+__all__ = [
+    "ppo_loss_factory",
+    "PPOConfig",
+    "RolloutBuffer",
+    "ActorCritic",
+    "DualEncoderActorCritic",
+]
 
 
 # Jax PPO Structures
@@ -25,43 +31,49 @@ class PPOConfig(NamedTuple):
 
     @property
     def loss_fn(self) -> Callable:
-        def ppo_loss(
-            params: dict, x: jax.Array, y: jax.Array, apply_fn: Callable
-        ) -> tuple[jax.Array, jax.Array]:
-            # Unpack output array
-            actions = y[:, 0].astype(int)
-            old_action_lp = y[:, 1]
-            advantages = y[:, 2]
-            returns = y[:, 3]
+        return ppo_loss_factory(self.clip_range, self.vf_coef, self.ent_coef)
 
-            # Query the current policy
-            logits, values = apply_fn({"params": params}, x)
-            log_probabilities = jax.nn.log_softmax(logits)
-            new_action_lp = log_probabilities[jnp.arange(len(actions)), actions]
 
-            # Compute ratio between old and new policy
-            ratio = jnp.exp(new_action_lp - old_action_lp)
+def ppo_loss_factory(
+    clip_range: float = 0.2, vf_coef: float = 0.5, ent_coef: float = 0.0
+) -> Callable:
+    def ppo_loss(
+        params: dict, x: jax.Array, y: jax.Array, apply_fn: Callable
+    ) -> tuple[jax.Array, jax.Array]:
+        # Unpack output array
+        actions = y[:, 0].astype(int)
+        old_action_lp = y[:, 1]
+        advantages = y[:, 2]
+        returns = y[:, 3]
 
-            # Policy loss (Clip surrogate loss)
-            policy_loss = jnp.mean(
-                jnp.maximum(
-                    -advantages * ratio,
-                    -advantages * jnp.clip(ratio, 1 - self.clip_range, 1 + self.clip_range),
-                )
+        # Query the current policy
+        logits, values = apply_fn({"params": params}, x)
+        log_probabilities = jax.nn.log_softmax(logits)
+        new_action_lp = log_probabilities[jnp.arange(len(actions)), actions]
+
+        # Compute ratio between old and new policy
+        ratio = jnp.exp(new_action_lp - old_action_lp)
+
+        # Policy loss (Clip surrogate loss)
+        policy_loss = jnp.mean(
+            jnp.maximum(
+                -advantages * ratio,
+                -advantages * jnp.clip(ratio, 1 - clip_range, 1 + clip_range),
             )
+        )
 
-            # Value loss (MSE)
-            value_loss = 0.5 * jnp.mean((values - returns) ** 2)
+        # Value loss (MSE)
+        value_loss = 0.5 * jnp.mean((values - returns) ** 2)
 
-            # Entropy loss
-            probabilities = jax.nn.softmax(logits)
-            entropy_loss = -jnp.sum(probabilities * log_probabilities, axis=-1).mean()
+        # Entropy loss
+        probabilities = jax.nn.softmax(logits)
+        entropy_loss = -jnp.sum(probabilities * log_probabilities, axis=-1).mean()
 
-            # Total loss
-            loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy_loss
-            return (loss, (policy_loss, value_loss, entropy_loss))
+        # Total loss
+        loss = policy_loss + vf_coef * value_loss - ent_coef * entropy_loss
+        return (loss, (policy_loss, value_loss, entropy_loss))
 
-        return ppo_loss
+    return ppo_loss
 
 
 class RolloutBuffer(NamedTuple):
